@@ -632,8 +632,36 @@ class AppleAppStore:
         print(
             f"\n[链路第 4 步：美区 Apple ID 充卡 (负债转移)]\n"
             f"  ④ [Apple 内部记账] 兑换码 [{gift_card.code}] 已核验！美国苹果公司将 ${gift_card.face_value:.2f} 预收负债"
-            f"绑定至美区账号 [{apple_id}] (当前账户美元余额: ${self.apple_id_balances[apple_id]:.2f} USD)"
+            f"绑定至美区账号 [{apple_id}] (当前 Apple 账户余额: ${self.apple_id_balances[apple_id]:.2f} USD)"
         )
+
+    def bind_payment_card(self, apple_id: str, card: VirtualCard, billing_zip: str = "97201") -> bool:
+        """
+        【模拟 account.apple.com -> 付款与配送 -> 添加付款方式】
+        苹果对 Apple ID 绑定银行卡的风控比普通商户消费更严苛，包含三重校验：
+        1. 严格锁区校验 (Storefront Country Match)：美区 Apple ID 要求纯正 'US' 本土卡，拒绝 'PR'(波多黎各)/'HK'/'CN' 跨区卡；
+        2. 预付虚拟卡 BIN 黑名单：苹果收单行(Chase Paymentech)直接拦截 454924 等高频虚拟 Prepaid 卡作为默认兜底扣款卡；
+        3. $0.00 预授权 + AVS (Address Verification System) 账单地址与邮编核验。
+        """
+        bin_prefix = card.card_number[:6]
+        print(
+            f"\n[Apple 账户中心 (account.apple.com) · 添加付款方式] "
+            f"用户 [{apple_id}] 尝试绑定卡 {bin_prefix}******{card.card_number[-4:]} (账单邮编: {billing_zip})"
+        )
+
+        # 校验 1 & 2：Apple 收单风控识别出 454924 是波多黎各(PR)离岸 Prepaid 虚拟卡段
+        if card.tier.region != "US" or card.tier.funding_type == "prepaid" or bin_prefix == "454924":
+            print(
+                f"  🚫 [Apple 风控拦截 · 绑卡失败] 苹果收单系统(Chase Paymentech) 拒绝将此卡保存为默认付款方式！\n"
+                f"     ├─ 原因 1 (锁区不匹配): 美区 Apple ID 要求美国本土('US')发行的银行卡，而 BIN [{bin_prefix}] 归属地为 '{card.tier.region}' (波多黎各离岸银行)\n"
+                f"     ├─ 原因 2 (拒绝虚拟预付卡兜底): 该卡属性为 '{card.tier.funding_type}' (Prepaid 虚拟卡)，苹果禁止使用高频虚拟卡段 [{bin_prefix}] 作为账户兜底付款方式\n"
+                f"     └─ ⚠️ 重要安全警告: 当你账户里已有礼品卡余额 (${self.apple_id_balances.get(apple_id, 0.0):.2f}) 时，"
+                f"切勿反复强行绑定 454924 虚拟卡，否则极易触发苹果反欺诈风控导致整个 Apple ID 被禁用！"
+            )
+            return False
+
+        print(f"  ✅ [Apple 账户中心] $0.00 AVS 地址校验通过，卡片绑定成功！")
+        return True
 
     def subscribe_via_iap(self, apple_id: str, merchant: "Merchant", plan_name: str, price: float) -> bool:
         """

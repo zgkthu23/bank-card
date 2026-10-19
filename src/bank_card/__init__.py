@@ -105,7 +105,10 @@ def main() -> None:
     # 第 4 步：美区 App Store 充卡（苹果内部将预收款负债绑定至美区 Apple ID）
     us_app_store.redeem_gift_card(us_apple_id, gift_card)
 
-    # 第 5 步：iOS 端内购订阅（苹果作为 MoR 法定卖方进行内部负债核销，并发送 JWS 收据立即激活 Claude Code）
+    # 插曲实测：用户在 account.apple.com 尝试将 454924 虚拟卡绑定为“付款方式”，触发苹果收单三重校验被拒
+    us_app_store.bind_payment_card(us_apple_id, roogoo_card)
+
+    # 第 5 步：无需绑定任何银行卡，直接用 Apple 账户余额在 iOS 端内购订阅（苹果作为 MoR 内部核销负债）
     us_app_store.subscribe_via_iap(
         apple_id=us_apple_id,
         merchant=anthropic,
