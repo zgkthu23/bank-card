@@ -1,6 +1,6 @@
 from bank_card.roles import (
     Acquirer,
-    AlipayGiftCardStore,
+    AlipayCrossBorderStore,
     AppleAppStore,
     CardNetwork,
     IssuerBank,
@@ -41,7 +41,6 @@ def main() -> None:
     roogoo = RoogooPlatform("Roogoo 平台")
     roogoo.connect_sponsor_bank(pr_bsji_bank)
 
-    # 初始化 Stripe 收单行（内置 StripeRadar 独立风控引擎）与不同风控等级的商户
     stripe = Acquirer("Stripe 收单行", visa_net)
     steam = Merchant("Steam 游戏商城 (全球开放)", stripe, country="US", mcc="5734")
     openai = Merchant(
@@ -85,38 +84,37 @@ def main() -> None:
         custom_card_number="4549 2418 55244109",
     )
 
-    # 1. 在 OpenAI 网页刷 4549 2418 55244109 -> 通过 Stripe Radar，到达 Roogoo 扣款成功
     alice.pay(openai, roogoo_card, amount=20.0, tx_minute=10)
-
-    # 2. 在 Anthropic 网页刷 4549 2418 55244109 订阅 Claude Code -> 被 Stripe Radar 第一关直接短路掐断！
     alice.pay(anthropic, roogoo_card, amount=20.0, tx_minute=15)
-
-    # 3. 立即打开 Roogoo 手机 App 核对账单：验证为什么 App 里没有任何失败记录、也没扣 $0.50 拒付费！
     roogoo.print_app_bill(roogoo_card)
 
     print("\n================================================================================")
-    print("  阶段 4：终极破局链路 —— 支付宝买美区 Apple 礼品卡 ➔ 充美区 Apple ID ➔ 内购订阅 Claude")
+    print("  阶段 4：深度拆解 6 步跨境链路 —— 人民币 ¥145 是如何变成美元进入 Anthropic 的？")
     print("================================================================================")
-    alipay_store = AlipayGiftCardStore()
     us_app_store = AppleAppStore()
+    alipay_cross_border = AlipayCrossBorderStore(us_app_store)
 
-    # 第 1 步：在 iPhone 上登录美区 Apple ID
     us_apple_id = "alice_us@icloud.com"
     us_app_store.register_us_apple_id(us_apple_id)
 
-    # 第 2 步：在支付宝小程序里用人民币买一张 $20.00 的美区 Apple Gift Card 兑换码
-    gift_card = alipay_store.buy_us_apple_gift_card("Alice", face_value_usd=20.0)
+    # 第 1~3 步：支付宝人民币付款 -> SAFE 外管局申报与银行购汇 -> SWIFT 汇给美国分销商 Pockyt -> 向美国苹果批发买码
+    gift_card = alipay_cross_border.buy_us_apple_gift_card(
+        user_name="Alice", id_card_no="1101011999********", face_value_usd=20.0
+    )
 
-    # 第 3 步：在美区 App Store 兑换礼品卡，余额变为 $20.00
+    # 第 4 步：美区 App Store 充卡（苹果内部将预收款负债绑定至美区 Apple ID）
     us_app_store.redeem_gift_card(us_apple_id, gift_card)
 
-    # 第 4 步：在 iOS 端 Claude App 内使用 Apple ID 余额内购订阅 Claude Pro (含 Claude Code)
+    # 第 5 步：iOS 端内购订阅（苹果作为 MoR 法定卖方进行内部负债核销，并发送 JWS 收据立即激活 Claude Code）
     us_app_store.subscribe_via_iap(
         apple_id=us_apple_id,
         merchant=anthropic,
         plan_name="Claude Pro (含 Claude Code 终端订阅权限)",
         price=20.0,
     )
+
+    # 第 6 步：苹果财月月结（T+30天），美国苹果总公司通过美国 ACH 清算网将 $14.00 USD 真正打给 Anthropic
+    us_app_store.run_monthly_developer_payout(anthropic)
 
     print("\n================================================================================")
     print("  阶段 5：VisaNet VAA 卡片历史行为画像库与黑客跨国盗刷熔断拦截")

@@ -532,85 +532,149 @@ class Acquirer:
         return resp
 
 
-class AlipayGiftCardStore:
+class AlipayCrossBorderStore:
     """
-    【支付宝 · 出境惠 / PockytShop 礼品卡小程序】
-    允许中国大陆用户直接用人民币（支付宝余额/国内储蓄卡）购买美区 Apple Gift Card 兑换码，无需任何海外银行卡！
+    【支付宝跨境收单 + 境内合作清算银行(中行) + 美国礼品卡分销商(Pockyt/InComm US)】
+    还原“人民币 ¥145 是如何合法出境变成美国苹果公司账上的美元”的真实金融链路：
+    1. 用户付 ¥145.00 CNY 给支付宝；
+    2. 支付宝凭《跨境外汇支付牌照》，将实名身份证与订单号报送国家外汇管理局(SAFE)进行真实贸易背景还原申报；
+    3. 境内合作银行按汇率将 ¥145.00 CNY 购汇兑换成 $20.00 USD（扣除跨境通道费 $0.40），通过 SWIFT 汇给美国分销商 Pockyt US；
+    4. 美国分销商留存 $0.20 分销差价，将 $19.40 USD 批发款打入【美国苹果总公司 (Apple Inc. US)】银行账户，激活 $20 面值兑换码！
     """
 
     USD_TO_CNY_RATE = 7.25
+    ALIPAY_FX_FEE_USD = 0.40       # 支付宝与境内清算行跨境购付汇通道费 ($0.40)
+    DISTRIBUTOR_MARGIN_USD = 0.20  # 美国分销商 (Pockyt/InComm) 批发差价利润 ($0.20)
 
-    def buy_us_apple_gift_card(self, user_name: str, face_value_usd: float) -> AppleGiftCard:
-        cny_cost = round(face_value_usd * self.USD_TO_CNY_RATE, 2)
+    def __init__(self, apple_us: "AppleAppStore"):
+        self.apple_us = apple_us
+        self.alipay_fx_revenue: float = 0.0
+        self.distributor_revenue: float = 0.0
+
+    def buy_us_apple_gift_card(self, user_name: str, id_card_no: str, face_value_usd: float) -> AppleGiftCard:
+        cny_paid = round(face_value_usd * self.USD_TO_CNY_RATE, 2)
         code = f"APPL-US-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
-        gift_card = AppleGiftCard(code=code, face_value=face_value_usd, region="US")
+
+        # 1. 支付宝向国家外汇管理局(SAFE)申报个人跨境电商购汇，境内银行将 CNY 换成 USD
+        self.alipay_fx_revenue = round(self.alipay_fx_revenue + self.ALIPAY_FX_FEE_USD, 2)
+        usd_wired_to_us_distributor = round(face_value_usd - self.ALIPAY_FX_FEE_USD, 2)
+
+        # 2. 美国礼品卡分销商(Pockyt/InComm)截留分销利润，向美国苹果总公司支付批发美元现金
+        self.distributor_revenue = round(self.distributor_revenue + self.DISTRIBUTOR_MARGIN_USD, 2)
+        wholesale_usd_to_apple = round(usd_wired_to_us_distributor - self.DISTRIBUTOR_MARGIN_USD, 2)
+
+        # 3. 美国苹果总公司收到真实美元现金，并在资产负债表上记下 $20.00 的“预收礼品卡负债(Deferred Revenue)”
+        gift_card = self.apple_us.issue_wholesale_gift_card(
+            code=code,
+            face_value_usd=face_value_usd,
+            cash_received_usd=wholesale_usd_to_apple,
+        )
+
         print(
-            f"\n[支付宝 · 苹果礼品卡小程序] 用户 [{user_name}] 使用支付宝人民币付款 ¥{cny_cost:.2f} "
-            f"(折合 ${face_value_usd:.2f})\n"
-            f"  └─ 🎁 成功出码！美区 Apple Gift Card 兑换码: 【{gift_card.code}】 (面值: ${gift_card.face_value:.2f})"
+            f"\n[链路第 1~3 步：跨境购付汇与美国分销批发]\n"
+            f"  ① [用户支付人民币] [{user_name}] 在支付宝小程序支付人民币 ¥{cny_paid:.2f} CNY (购买 ${face_value_usd:.2f} 美区礼品卡)\n"
+            f"  ② [外管局申报与银行购汇] 支付宝凭跨境牌照向国家外汇管理局(SAFE)申报实名订单 (身份证:{id_card_no})，\n"
+            f"     境内合作银行将 ¥{cny_paid:.2f} CNY 购汇为 ${face_value_usd:.2f} USD (扣除跨境通道费 ${self.ALIPAY_FX_FEE_USD:.2f} 后，"
+            f"通过 SWIFT 电汇 ${usd_wired_to_us_distributor:.2f} USD 给美国分销商 Pockyt US)\n"
+            f"  ③ [美国分销商向 Apple Inc. 批发进货] Pockyt US 留存分销毛利 ${self.DISTRIBUTOR_MARGIN_USD:.2f}，"
+            f"向【美国苹果总公司】银行账户支付批发款 ${wholesale_usd_to_apple:.2f} USD，成功激活兑换码: 【{gift_card.code}】"
         )
         return gift_card
 
 
 class AppleAppStore:
     """
-    【美区 Apple App Store & In-App Purchase (IAP) 内购结算中心】
-    核心破局原理：
-    用户用礼品卡充值美区 Apple ID 余额后，在 iOS 端 Claude App 内发起订阅。
-    扣款完全在苹果内部账本完成（根本不经过 Stripe Radar，也不经过 VisaNet，没有任何银行卡 BIN 校验！），
-    随后苹果服务器直接向 Anthropic 发送加密签名凭据 (JWS Receipt) 通知开通会员！
+    【美国苹果总公司 (Apple Inc., Cupertino) —— 法定记录商户 (MoR) 与内部负债核销中心】
+    核心金融机制：
+    1. 预收款负债池 (deferred_liability_pool)：当礼品卡卖出时，美元真钱已经进了苹果美国银行账户，苹果记下 $20 预收负债。
+    2. MoR (Merchant of Record，法定二道贩子)：用户内购订阅 Claude 时，合同双方是【用户 <-> 美国苹果公司】。
+       苹果不做任何银行卡网络请求，只做【内部总账负债核销】：
+       - 核销用户的 $20.00 Apple ID 负债余额；
+       - 确认 30% 苹果税收入 ($6.00)；
+       - 在《应付开发者账本 (developer_payable_ledger)》给 Anthropic 记上 +$14.00 USD。
+    3. 苹果财月月度结算 (run_monthly_developer_payout)：月底通过美国本土 ACH 银行网将 $14.00 USD 电汇给 Anthropic！
     """
 
     APPLE_TAX_RATE = 0.30  # 苹果内购抽成 30%
 
     def __init__(self):
-        # 美区 Apple ID -> 账户美元余额 (Apple Account Balance)
-        self.apple_id_balances: dict[str, float] = {}
-        self.revenue: float = 0.0
+        self.apple_us_bank_cash: float = 0.0              # 美国苹果总公司银行账户里的真实美元现金
+        self.unredeemed_card_liability: float = 0.0       # 尚未绑定到 Apple ID 的在外礼品卡负债
+        self.apple_id_balances: dict[str, float] = {}     # 美区 Apple ID 账户余额（已绑定的预收款负债）
+        self.developer_payables: dict[str, float] = {}    # 应付开发者账款 (如欠 Anthropic 的月度结算款)
+        self.net_commission_revenue: float = 0.0          # 苹果净赚的平台佣金（扣除礼品卡批发折让成本）
+
+    def issue_wholesale_gift_card(
+        self, code: str, face_value_usd: float, cash_received_usd: float
+    ) -> AppleGiftCard:
+        """美国苹果收到分销商打来的美元批发款，激活一张面值 $20 的礼品卡，记入预收款负债"""
+        self.apple_us_bank_cash = round(self.apple_us_bank_cash + cash_received_usd, 2)
+        self.unredeemed_card_liability = round(self.unredeemed_card_liability + face_value_usd, 2)
+        return AppleGiftCard(code=code, face_value=face_value_usd, region="US")
 
     def register_us_apple_id(self, apple_id: str) -> None:
         self.apple_id_balances[apple_id] = 0.0
-        print(f"[Apple App Store (美区)] 用户已登录美区 Apple ID: [{apple_id}] (当前账户余额: $0.00)")
+        print(f"\n[Apple App Store (美区)] 用户已登录美区 Apple ID: [{apple_id}]")
 
     def redeem_gift_card(self, apple_id: str, gift_card: AppleGiftCard) -> None:
-        """将支付宝买到的美区 Apple Gift Card 充值进美区 Apple ID 余额"""
+        """用户在美区 App Store 输入兑换码：苹果将负债从“不记名卡池”转移到“用户 Apple ID 账下”"""
         gift_card.redeemed = True
+        self.unredeemed_card_liability = round(self.unredeemed_card_liability - gift_card.face_value, 2)
         self.apple_id_balances[apple_id] = round(
             self.apple_id_balances.get(apple_id, 0.0) + gift_card.face_value, 2
         )
         print(
-            f"[Apple App Store (美区)] 兑换码 [{gift_card.code}] 充值成功！\n"
-            f"  └─ 🍎 美区 Apple ID [{apple_id}] 当前可用余额: ${self.apple_id_balances[apple_id]:.2f}"
+            f"\n[链路第 4 步：美区 Apple ID 充卡 (负债转移)]\n"
+            f"  ④ [Apple 内部记账] 兑换码 [{gift_card.code}] 已核验！美国苹果公司将 ${gift_card.face_value:.2f} 预收负债"
+            f"绑定至美区账号 [{apple_id}] (当前账户美元余额: ${self.apple_id_balances[apple_id]:.2f} USD)"
         )
 
     def subscribe_via_iap(self, apple_id: str, merchant: "Merchant", plan_name: str, price: float) -> bool:
-        """在 iOS 端 App 内通过 Apple ID 余额发起内购订阅 (In-App Purchase)"""
-        print(
-            f"\n[iOS 端 {merchant.name} App · Apple IAP 内购收银台] "
-            f"用户 [{apple_id}] 点击订阅【{plan_name}】(${price:.2f}/月)"
-        )
+        """
+        用户在 iOS 端 App 内点击订阅：
+        苹果作为 MoR (Merchant of Record 法定卖方) 进行内部负债核销，并向 Anthropic 发送 JWS 签名凭据
+        """
         balance = self.apple_id_balances.get(apple_id, 0.0)
         if balance < price:
-            print(f"  <- [Apple IAP] 订阅失败：Apple ID 余额不足 (${balance:.2f} < ${price:.2f})")
             return False
 
-        # 1. 直接从 Apple ID 余额扣款（彻底绕开 Stripe 与银行卡网络！）
+        # 内部会计核销分录：借记 Apple ID 负债 -$20 -> 贷记 应付开发者账款 +$14.00 & 苹果佣金 +$6.00
         self.apple_id_balances[apple_id] = round(balance - price, 2)
-        apple_commission = round(price * self.APPLE_TAX_RATE, 2)
-        merchant_net = round(price - apple_commission, 2)
-        self.revenue = round(self.revenue + apple_commission, 2)
-        merchant.corporate_bank_balance = round(merchant.corporate_bank_balance + merchant_net, 2)
+        apple_gross_tax = round(price * self.APPLE_TAX_RATE, 2)
+        developer_share = round(price - apple_gross_tax, 2)
+        self.developer_payables[merchant.name] = round(
+            self.developer_payables.get(merchant.name, 0.0) + developer_share, 2
+        )
 
         jws_receipt = f"APPLE-JWS-RECEIPT-{random.randint(10000, 99999)}"
         print(
-            f"  -> [Apple IAP 内部账本扣款] 已从 [{apple_id}] 的 Apple ID 余额扣除 ${price:.2f} "
-            f"(剩余: ${self.apple_id_balances[apple_id]:.2f})\n"
-            f"     ⚡ 绕过验证：全程未经过 Stripe Radar，无需校验任何银行卡 BIN 或 Prepaid 属性！\n"
-            f"  -> [Apple 佣金结算] 苹果截留 30% 苹果税 (${apple_commission:.2f})，向 [{merchant.name}] 结算 ${merchant_net:.2f}\n"
-            f"  -> [App Store Server Notification] 向 [{merchant.name}] 服务器发送苹果官方签名凭据: {jws_receipt}"
+            f"\n[链路第 5 步：iOS 端内购订阅 —— 苹果作为 MoR (法定记录商户) 执行内部负债核销]\n"
+            f"  ⑤ [为什么不用过 Stripe？] 在法律上，是【美国苹果公司】把 Claude 会员卖给用户，苹果自己承担100%反欺诈责任！\n"
+            f"     · [Apple 内部会计核销] 扣减 [{apple_id}] 余额 -${price:.2f} (无需调用任何银行/卡组织网络，因为美元真钱早在第③步已进苹果美国银行账户)\n"
+            f"     · [Apple 内部切分账本] 苹果截留 30% 苹果税 (${apple_gross_tax:.2f}) | 记入《应付开发者 [{merchant.name}] 月度账本》: +${developer_share:.2f} USD\n"
+            f"     · [T+0 实时发货通知] 苹果服务器向 [{merchant.name}] 发送官方加密签名收据: {jws_receipt}"
         )
         merchant.activate_by_apple_iap(apple_id, plan_name, jws_receipt)
         return True
+
+    def run_monthly_developer_payout(self, merchant: "Merchant") -> None:
+        """【苹果财月月结 T+30~45天】美国苹果总公司通过美国本土 ACH 银行清算网，将 $14.00 USD 真正打入 Anthropic 美国银行卡"""
+        payable = self.developer_payables.get(merchant.name, 0.0)
+        if payable <= 0:
+            return
+
+        self.developer_payables[merchant.name] = 0.0
+        self.apple_us_bank_cash = round(self.apple_us_bank_cash - payable, 2)
+        merchant.corporate_bank_balance = round(merchant.corporate_bank_balance + payable, 2)
+
+        print(
+            f"\n[链路第 6 步：苹果财月月度结算 (T+30天) —— 美元最终流向 Anthropic]\n"
+            f"  ⑥ [美国本土 ACH 跨行电汇] 美国苹果总公司 (Apple Inc. US) 从其美国银行账户划出 ${payable:.2f} USD，\n"
+            f"     直接打入 [{merchant.name}] 的美国企业对公银行账户！\n"
+            f"     📊 最终资金闭环盘点：你付的 ¥145.00 CNY ($20.00) ➔\n"
+            f"        支付宝跨境通道拿走 $0.40 | 美国分销商 Pockyt 拿走 $0.20 | 苹果净留存 $5.40 (名义苹果税$6.00 - 批发折让$0.60) | "
+            f"{merchant.name} 银行卡实收: ${merchant.corporate_bank_balance:.2f} USD！"
+        )
 
 
 class Merchant:
