@@ -1,10 +1,10 @@
 from bank_card.roles import (
     Acquirer,
-    AlipayCrossBorderStore,
     AppleAppStore,
     CardNetwork,
     IssuerBank,
     Merchant,
+    PockytAlipayChain,
     RoogooPlatform,
     User,
     verify_luhn,
@@ -89,16 +89,16 @@ def main() -> None:
     roogoo.print_app_bill(roogoo_card)
 
     print("\n================================================================================")
-    print("  阶段 4：深度拆解 6 步跨境链路 —— 人民币 ¥145 是如何变成美元进入 Anthropic 的？")
+    print("  阶段 4：深度拆解 Pockyt (Yuansfer) 6 步跨境链路 —— 人民币 ¥145 如何变成美元进入 Anthropic？")
     print("================================================================================")
     us_app_store = AppleAppStore()
-    alipay_cross_border = AlipayCrossBorderStore(us_app_store)
+    pockyt_chain = PockytAlipayChain(us_app_store)
 
     us_apple_id = "alice_us@icloud.com"
     us_app_store.register_us_apple_id(us_apple_id)
 
-    # 第 1~3 步：支付宝人民币付款 -> SAFE 外管局申报与银行购汇 -> SWIFT 汇给美国分销商 Pockyt -> 向美国苹果批发买码
-    gift_card = alipay_cross_border.buy_us_apple_gift_card(
+    # 第 1~3 步：支付宝切旧金山进 PockytShop 付款 -> SAFE 申报与银行购汇 -> SWIFT 汇给美国 Pockyt (Yuansfer) -> 向美国苹果批发买码
+    gift_card = pockyt_chain.buy_from_pockytshop(
         user_name="Alice", id_card_no="1101011999********", face_value_usd=20.0
     )
 

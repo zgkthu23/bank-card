@@ -532,36 +532,40 @@ class Acquirer:
         return resp
 
 
-class AlipayCrossBorderStore:
+class PockytAlipayChain:
     """
-    【支付宝跨境收单 + 境内合作清算银行(中行) + 美国礼品卡分销商(Pockyt/InComm US)】
-    还原“人民币 ¥145 是如何合法出境变成美国苹果公司账上的美元”的真实金融链路：
-    1. 用户付 ¥145.00 CNY 给支付宝；
-    2. 支付宝凭《跨境外汇支付牌照》，将实名身份证与订单号报送国家外汇管理局(SAFE)进行真实贸易背景还原申报；
-    3. 境内合作银行按汇率将 ¥145.00 CNY 购汇兑换成 $20.00 USD（扣除跨境通道费 $0.40），通过 SWIFT 汇给美国分销商 Pockyt US；
-    4. 美国分销商留存 $0.20 分销差价，将 $19.40 USD 批发款打入【美国苹果总公司 (Apple Inc. US)】银行账户，激活 $20 面值兑换码！
+    【支付宝“惠出境” + Pockyt (原 Yuansfer 源汇) 跨境收单网关 + PockytShop 商城 + InComm 一级总代】
+    完整还原你在支付宝定位切到美国旧金山、进入 PockytShop 买 $20 美区苹果卡的真实链路：
+    1. Pockyt (Yuansfer Inc.) 是总部位于美国纽约的跨境聚合支付网关（专门帮海外商户收中国人的支付宝/微信人民币）。
+    2. Pockyt 自己开了一家数字礼品卡商城 PockytShop (shop.pockyt.io)，嵌入在支付宝“惠出境”小程序里。
+    3. 当你付 ¥145.00 CNY 时：
+       - [境内端] 支付宝扣除你的人民币，凭《跨境外汇支付牌照》把你的身份证号+订单号报送国家外汇管理局(SAFE)做真实跨境消费申报；
+       - [购汇出境] 境内清算银行(如中行)在银行间外汇市场将 ¥145.00 CNY 购汇成 $20.00 USD (扣 $0.30 跨境清算费)，
+         通过 SWIFT 电汇至 Pockyt (Yuansfer Inc.) 在美国摩根大通银行的美元清算账户；
+       - [批发激活] Pockyt 截留 $0.30 分销毛利，调用苹果美国一级总代 (InComm / Blackhawk) 接口，
+         向【美国苹果总公司 (Apple Inc. US)】支付 $19.40 USD 批发款，实时激活一张 $20.00 面值的美区兑换码发给你！
     """
 
     USD_TO_CNY_RATE = 7.25
-    ALIPAY_FX_FEE_USD = 0.40       # 支付宝与境内清算行跨境购付汇通道费 ($0.40)
-    DISTRIBUTOR_MARGIN_USD = 0.20  # 美国分销商 (Pockyt/InComm) 批发差价利润 ($0.20)
+    ALIPAY_CROSS_BORDER_FEE = 0.30  # 支付宝与境内清算行跨境购汇通道费 ($0.30)
+    POCKYT_INCOMM_MARGIN = 0.30     # PockytShop 与上游总代 InComm 的分销毛利 ($0.30)
 
     def __init__(self, apple_us: "AppleAppStore"):
         self.apple_us = apple_us
         self.alipay_fx_revenue: float = 0.0
-        self.distributor_revenue: float = 0.0
+        self.pockyt_revenue: float = 0.0
 
-    def buy_us_apple_gift_card(self, user_name: str, id_card_no: str, face_value_usd: float) -> AppleGiftCard:
+    def buy_from_pockytshop(self, user_name: str, id_card_no: str, face_value_usd: float) -> AppleGiftCard:
         cny_paid = round(face_value_usd * self.USD_TO_CNY_RATE, 2)
-        code = f"APPL-US-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
+        code = f"X9POCKYT{random.randint(10000000, 99999999)}"
 
-        # 1. 支付宝向国家外汇管理局(SAFE)申报个人跨境电商购汇，境内银行将 CNY 换成 USD
-        self.alipay_fx_revenue = round(self.alipay_fx_revenue + self.ALIPAY_FX_FEE_USD, 2)
-        usd_wired_to_us_distributor = round(face_value_usd - self.ALIPAY_FX_FEE_USD, 2)
+        # 1. 支付宝向国家外汇管理局(SAFE)申报个人跨境电商购汇，境内银行将 CNY 换成 USD 汇给美国 Pockyt (Yuansfer)
+        self.alipay_fx_revenue = round(self.alipay_fx_revenue + self.ALIPAY_CROSS_BORDER_FEE, 2)
+        usd_settled_to_pockyt = round(face_value_usd - self.ALIPAY_CROSS_BORDER_FEE, 2)
 
-        # 2. 美国礼品卡分销商(Pockyt/InComm)截留分销利润，向美国苹果总公司支付批发美元现金
-        self.distributor_revenue = round(self.distributor_revenue + self.DISTRIBUTOR_MARGIN_USD, 2)
-        wholesale_usd_to_apple = round(usd_wired_to_us_distributor - self.DISTRIBUTOR_MARGIN_USD, 2)
+        # 2. Pockyt (Yuansfer) 截留分销差价，通过一级总代 InComm 向美国苹果总公司支付美元批发款
+        self.pockyt_revenue = round(self.pockyt_revenue + self.POCKYT_INCOMM_MARGIN, 2)
+        wholesale_usd_to_apple = round(usd_settled_to_pockyt - self.POCKYT_INCOMM_MARGIN, 2)
 
         # 3. 美国苹果总公司收到真实美元现金，并在资产负债表上记下 $20.00 的“预收礼品卡负债(Deferred Revenue)”
         gift_card = self.apple_us.issue_wholesale_gift_card(
@@ -571,13 +575,15 @@ class AlipayCrossBorderStore:
         )
 
         print(
-            f"\n[链路第 1~3 步：跨境购付汇与美国分销批发]\n"
-            f"  ① [用户支付人民币] [{user_name}] 在支付宝小程序支付人民币 ¥{cny_paid:.2f} CNY (购买 ${face_value_usd:.2f} 美区礼品卡)\n"
-            f"  ② [外管局申报与银行购汇] 支付宝凭跨境牌照向国家外汇管理局(SAFE)申报实名订单 (身份证:{id_card_no})，\n"
-            f"     境内合作银行将 ¥{cny_paid:.2f} CNY 购汇为 ${face_value_usd:.2f} USD (扣除跨境通道费 ${self.ALIPAY_FX_FEE_USD:.2f} 后，"
-            f"通过 SWIFT 电汇 ${usd_wired_to_us_distributor:.2f} USD 给美国分销商 Pockyt US)\n"
-            f"  ③ [美国分销商向 Apple Inc. 批发进货] Pockyt US 留存分销毛利 ${self.DISTRIBUTOR_MARGIN_USD:.2f}，"
-            f"向【美国苹果总公司】银行账户支付批发款 ${wholesale_usd_to_apple:.2f} USD，成功激活兑换码: 【{gift_card.code}】"
+            f"\n[链路第 1~3 步：支付宝 ➔ Pockyt (Yuansfer) 跨境购汇 ➔ 美国苹果总公司]\n"
+            f"  ① [支付宝切旧金山 · PockytShop 下单] [{user_name}] 选购 ${face_value_usd:.2f} 美区 Apple 礼品卡，"
+            f"用支付宝人民币支付 ¥{cny_paid:.2f} CNY\n"
+            f"  ② [SAFE 外管局申报 + 银行代客购汇] 支付宝凭跨境外汇牌照向国家外管局(SAFE)还原申报实名订单 (身份证:{id_card_no})，\n"
+            f"     境内合作银行将 ¥{cny_paid:.2f} CNY 购汇为 ${face_value_usd:.2f} USD (扣除跨境清算费 ${self.ALIPAY_CROSS_BORDER_FEE:.2f})，\n"
+            f"     通过 SWIFT 电汇 ${usd_settled_to_pockyt:.2f} USD 至【美国 Pockyt (Yuansfer Inc.) 纽约美元收单账户】\n"
+            f"  ③ [Pockyt + 一级总代 InComm 批发激活] Pockyt 留存分销毛利 ${self.POCKYT_INCOMM_MARGIN:.2f}，"
+            f"通过一级总代 InComm 向【美国苹果总公司 (Apple Inc.)】支付批发款 ${wholesale_usd_to_apple:.2f} USD，\n"
+            f"     实时提取 16 位美区兑换码发至你的页面/邮箱: 【{gift_card.code}】"
         )
         return gift_card
 
