@@ -6,12 +6,24 @@ from bank_card.roles import (
     RoogooPlatform,
     SuPayPlatform,
     User,
+    verify_luhn,
 )
 
 
 def main() -> None:
     print("================================================================================")
-    print("  阶段 1：构建全球清算网 —— 接入中国大陆(CN)、中国香港(HK)与美国(US)发卡行")
+    print("  阶段 0：解析真实 Roogoo 乐享卡号 [4549 2418 55244109] 的 BIN 归属与 Luhn 校验")
+    print("================================================================================")
+    real_pan = "4549241855244109"
+    print(f"  📌 真实卡号: {real_pan} (格式化: 4549 2418 5524 4109)")
+    print(f"  ├─ 首数字 (MII 行业标识): '{real_pan[0]}' ➔ 代表【Visa 卡组织】(注: 4开头必为Visa，5或2开头才是Mastercard)")
+    print(f"  ├─ 6位 BIN: {real_pan[:6]} | 8位扩展 BIN: {real_pan[:8]}")
+    print("  ├─ 底层持牌发卡行: 波多黎各圣胡安国际银行 (Banco San Juan Internacional, Inc. / BSJI)")
+    print("  ├─ 归属国家/地区: 美属波多黎各 (Puerto Rico, PR/US 美元清算区，持 IFE 国际金融实体牌照)")
+    print(f"  └─ 最后1位 Luhn 模10校验位: '{real_pan[-1]}' ➔ 算法校验结果: {verify_luhn(real_pan)}")
+
+    print("\n================================================================================")
+    print("  阶段 1：构建全球清算网 —— 接入中国大陆(CN)、中国香港(HK)与美属波多黎各(US/PR)发卡行")
     print("================================================================================")
     visa_net = CardNetwork("VisaNet")
 
@@ -27,15 +39,17 @@ def main() -> None:
     visa_net.register_issuer("451420", hsbc_hk_bank)
     visa_net.register_issuer("538720", za_hk_bank)
 
-    # 3. 美国(US) 虚拟卡平台背后的持牌合作发卡行 (BIN Sponsor)
-    us_sutton_bank = IssuerBank("美国波多黎各发卡行(Sutton Bank)", region="US", scheme="Visa")
+    # 3. 美属波多黎各/美国(US) 虚拟卡平台背后的真实持牌发卡行 (BIN 454924 -> BSJI)
+    pr_bsji_bank = IssuerBank(
+        "波多黎各圣胡安国际银行(Banco San Juan Internacional)", region="US", scheme="Visa"
+    )
     us_cross_river_bank = IssuerBank("美国商业发卡行(Cross River Bank)", region="US", scheme="Mastercard")
-    visa_net.register_issuer("428800", us_sutton_bank)
+    visa_net.register_issuer("454924", pr_bsji_bank)
     visa_net.register_issuer("556789", us_cross_river_bank)
 
     # 虚拟卡平台接入上游银行
     roogoo = RoogooPlatform("Roogoo 平台")
-    roogoo.connect_sponsor_bank(us_sutton_bank)
+    roogoo.connect_sponsor_bank(pr_bsji_bank)
     roogoo.connect_sponsor_bank(za_hk_bank)
 
     supay = SuPayPlatform("SuPay 平台")
@@ -43,9 +57,7 @@ def main() -> None:
 
     # 初始化收单行 Stripe 与不同地区政策的海外商户
     stripe = Acquirer("Stripe 收单行", visa_net)
-    # 普通国际商户（如 Steam / 亚马逊）：只要是 Visa 卡，无论中国大陆、香港还是美国发行的全都欢迎！
     steam = Merchant("Steam 游戏商城 (全球开放商户)", stripe, country="US", mcc="5734", blocked_regions=None)
-    # 政策受限商户（如 OpenAI / Claude）：虽然同样接了 Visa，但受合规政策影响，严禁接收 CN(中国大陆) 和 HK(中国香港) 银行卡的付款！
     openai = Merchant(
         "OpenAI (受政策限制的AI商户)",
         stripe,
@@ -59,7 +71,6 @@ def main() -> None:
     print("  阶段 2：真实痛点还原 —— 为什么有招行/中行/香港汇丰的 Visa 卡，却付不了 OpenAI？")
     print("================================================================================")
     alice = User("Alice")
-    # Alice 本来就有中国大陆和香港正规银行发行的 Visa 卡（0开卡费、0平台手续费）
     cmb_visa = cmb_cn_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="招商银行全币种国际Visa卡(CN)")
     boc_visa = boc_cn_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="中国银行长城卓隽留学Visa卡(CN)")
     hsbc_hk_visa = hsbc_hk_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="香港汇丰银行Pulse Visa卡(HK)")
@@ -74,16 +85,22 @@ def main() -> None:
     alice.pay(openai, hsbc_hk_visa, amount=20.0, tx_minute=8)
 
     print("\n================================================================================")
-    print("  阶段 3：借道破局 —— 为什么必须用虚拟卡平台的【美国卡段 (US BIN)】？")
+    print("  阶段 3：使用真实 Roogoo 乐享卡 [4549 2418 55244109] 借道波多黎各(US/PR)破局")
     print("================================================================================")
     roogoo.complete_kyc("Alice")
     roogoo.deposit_usdt("Alice", 600.0)
-    # 如果在 Roogoo 开的是【香港卡段 (538720·HK)】虚拟卡，去付 OpenAI 照样会被政策拦截！
+
+    # 先试香港卡段 (538720·HK) -> 依然被拦截
     roogoo_hk_card = roogoo.open_card("Alice", "PREMIER", load_amount=50.0)
     alice.pay(openai, roogoo_hk_card, amount=20.0, tx_minute=9)
 
-    # 只有开通底层挂靠在美国银行 (Sutton Bank) 的【美国卡段 (428800·US)】虚拟卡，才能绕过 CN/HK 政策封锁！
-    roogoo_us_card = roogoo.open_card("Alice", "ENJOY", load_amount=500.0)
+    # 开通真实卡号 4549 2418 55244109 (BIN 454924 · 波多黎各圣胡安国际银行 BSJI) -> 顺利通过！
+    roogoo_us_card = roogoo.open_card(
+        "Alice",
+        "ENJOY",
+        load_amount=500.0,
+        custom_card_number="4549 2418 55244109",
+    )
     alice.pay(openai, roogoo_us_card, amount=20.0, tx_minute=10)
     alice.pay(openai, roogoo_us_card, amount=20.0, tx_minute=120)
 
@@ -93,7 +110,7 @@ def main() -> None:
     visa_net.print_card_profiles()
 
     print(
-        f"\n🕵️ [黑客视角] 窃取了 Alice 的美国虚拟卡 {roogoo_us_card.card_number} 与正确 CVV ({roogoo_us_card.cvv})，"
+        f"\n🕵️ [黑客视角] 窃取了 Alice 的真实卡号 {roogoo_us_card.card_number} 与正确 CVV ({roogoo_us_card.cvv})，"
         f"先在 T+125m 发起 $1 小额探卡，随后在 T+128m (仅隔3分钟) 跨国在俄罗斯盗刷 $300："
     )
     openai.checkout(roogoo_us_card.card_number, roogoo_us_card.cvv, roogoo_us_card.expiry, amount=1.0, tx_minute=125)

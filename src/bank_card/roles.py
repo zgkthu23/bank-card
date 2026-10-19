@@ -13,9 +13,28 @@ from bank_card.models import (
 REGION_NAMES = {
     "CN": "中国大陆",
     "HK": "中国香港",
-    "US": "美国",
+    "US": "美国(含美属波多黎各PR)",
     "RU": "俄罗斯",
 }
+
+
+def calculate_luhn_check_digit(partial_15_digits: str) -> str:
+    """根据前 15 位数字，使用 Luhn (模10) 算法计算第 16 位校验位"""
+    total = 0
+    # 从右往左，奇数位(即倒数第1、3、5...位，对应15位中的偶数索引)乘以 2
+    for idx, ch in enumerate(reversed(partial_15_digits)):
+        d = int(ch)
+        if idx % 2 == 0:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return str((10 - (total % 10)) % 10)
+
+
+def verify_luhn(card_number: str) -> bool:
+    """校验 16 位银行卡号是否符合国际 ISO/IEC 7812 Luhn 模 10 算法"""
+    return calculate_luhn_check_digit(card_number[:-1]) == card_number[-1]
 
 
 class CardNetwork:
@@ -149,8 +168,8 @@ class CardNetwork:
 class IssuerBank:
     """
     持牌发卡银行（支持两种模式）：
-    1. 传统直连银行模式（如中国大陆的招商银行/中国银行、中国香港的汇丰银行）：直接给个人发全币种 Visa 卡
-    2. BaaS 合作发卡行模式（如美国波多黎各 Sutton Bank）：将 BIN 租给 Roogoo/SuPay 等虚拟卡平台
+    1. 传统直连银行模式（如中国大陆的招商银行/中国银行、中国香港的汇丰银行）
+    2. BaaS 合作发卡行模式（如美属波多黎各 Banco San Juan Internacional）：将 BIN 454924 租给 Roogoo
     """
 
     INTERCHANGE_FEE_RATE = 0.0175
@@ -159,7 +178,7 @@ class IssuerBank:
 
     def __init__(self, name: str, region: str, scheme: str = "Visa"):
         self.name = name
-        self.region = region  # "CN"(中国大陆) | "HK"(中国香港) | "US"(美国)
+        self.region = region  # "CN"(中国大陆) | "HK"(中国香港) | "US"(美国/美属波多黎各)
         self.scheme = scheme
         self.bin_prefix: str = ""
         self.cards: dict[str, VirtualCard] = {}
@@ -169,7 +188,7 @@ class IssuerBank:
         self.bin_suspended: bool = False
 
     def issue_direct_card(self, owner: str, initial_balance: float, card_name: str = "") -> VirtualCard:
-        """【传统银行直发模式】如用户直接在招商银行或香港汇丰申请一张 Visa 卡（0开卡费、0平台消费手续费）"""
+        """【传统银行直发模式】"""
         region_cn = REGION_NAMES.get(self.region, self.region)
         display_name = card_name or f"{self.name}·{self.scheme}卡({region_cn})"
         tier = CardTierConfig(
@@ -186,15 +205,26 @@ class IssuerBank:
         )
         print(
             f"[{self.name} 直发卡成功] 持卡人: {owner} | 卡名: {display_name} | "
-            f"卡号: {card.card_number} (BIN:{self.bin_prefix}·{self.region}) | 额度: ${initial_balance:.2f}"
+            f"卡号: {card.card_number} (BIN:{self.bin_prefix}·{self.region} | Luhn校验:{verify_luhn(card.card_number)}) | 额度: ${initial_balance:.2f}"
         )
         return card
 
     def create_card_record(
-        self, owner: str, user_label: str, tier: CardTierConfig, initial_balance: float
+        self,
+        owner: str,
+        user_label: str,
+        tier: CardTierConfig,
+        initial_balance: float,
+        custom_card_number: str | None = None,
     ) -> VirtualCard:
-        random_digits = "".join(str(random.randint(0, 9)) for _ in range(10))
-        card_number = f"{self.bin_prefix}{random_digits}"
+        if custom_card_number:
+            card_number = custom_card_number.replace(" ", "")
+        else:
+            random_9_digits = "".join(str(random.randint(0, 9)) for _ in range(9))
+            partial_15 = f"{self.bin_prefix}{random_9_digits}"
+            check_digit = calculate_luhn_check_digit(partial_15)
+            card_number = f"{partial_15}{check_digit}"
+
         cvv = f"{random.randint(100, 999)}"
         card = VirtualCard(
             card_number=card_number,
@@ -219,7 +249,6 @@ class IssuerBank:
         if card.cvv != req.cvv or card.expiry != req.expiry:
             return AuthResponse(approved=False, code="N7", message="CVV 或有效期校验失败")
 
-        # 读取 VisaNet 注入报文的 VAA 风险分
         if req.vaa_score >= self.VAA_BLOCK_THRESHOLD:
             print(
                 f"  🛡️ [{self.name} 反欺诈熔断] 检测到报文中 Visa VAA 评分高达 {req.vaa_score}/99 "
@@ -239,11 +268,9 @@ class IssuerBank:
                 return AuthResponse(approved=False, code="3D", message="卡片不支持 3DS 验证")
             print(f"  -> [{self.name} 3DS 验证通过] 持卡人 [{card.user_label}] 已完成 3DS 动态码验证")
 
-        # 如果是 BaaS 虚拟卡平台合作发行的卡，转发给虚拟卡平台（Roogoo / SuPay）Webhook
         if self.baas_platform:
             return self.baas_platform.handle_auth_webhook(card, req)
 
-        # 否则是传统银行（如招商银行/香港汇丰）自己直接发行的 Visa 卡，直接扣减额度，无中间商附加费！
         if card.available_balance < req.amount:
             return AuthResponse(approved=False, code="51", message="银行卡可用额度不足")
 
@@ -263,8 +290,8 @@ class RoogooPlatform:
     CARD_TIERS: dict[str, CardTierConfig] = {
         "ENJOY": CardTierConfig(
             tier_code="ENJOY",
-            display_name="Roogoo·乐享卡(美国Visa虚拟卡)",
-            bin_prefix="428800",
+            display_name="Roogoo·乐享卡(真实卡段454924·波多黎各BSJI)",
+            bin_prefix="454924",
             region="US",
             open_fee=0.0,
             tx_fee_rate=0.01,
@@ -304,7 +331,13 @@ class RoogooPlatform:
     def deposit_usdt(self, user_name: str, usdt_amount: float) -> None:
         self.user_usd_wallets[user_name] = round(self.user_usd_wallets.get(user_name, 0.0) + usdt_amount, 2)
 
-    def open_card(self, user_name: str, tier_code: str, load_amount: float) -> VirtualCard:
+    def open_card(
+        self,
+        user_name: str,
+        tier_code: str,
+        load_amount: float,
+        custom_card_number: str | None = None,
+    ) -> VirtualCard:
         tier = self.CARD_TIERS[tier_code]
         total_cost = round(tier.open_fee + load_amount, 2)
         self.user_usd_wallets[user_name] = round(self.user_usd_wallets[user_name] - total_cost, 2)
@@ -312,11 +345,16 @@ class RoogooPlatform:
 
         sponsor_bank = self.sponsor_banks[tier.bin_prefix]
         card = sponsor_bank.create_card_record(
-            owner=user_name, user_label=user_name, tier=tier, initial_balance=load_amount
+            owner=user_name,
+            user_label=user_name,
+            tier=tier,
+            initial_balance=load_amount,
+            custom_card_number=custom_card_number,
         )
         print(
-            f"[{self.name} 开卡成功] 持卡人: {card.owner} | 卡种: {tier.display_name} | "
-            f"卡号: {card.card_number} (BIN:{tier.bin_prefix}·{tier.region}) | 余额: ${card.available_balance:.2f}"
+            f"[{self.name} 开卡成功] 持卡人: {card.owner} | 卡种: {tier.display_name}\n"
+            f"  └─ 卡号: {card.card_number} (6位BIN:{card.card_number[:6]} | 8位BIN:{card.card_number[:8]} | "
+            f"Luhn校验通过:{verify_luhn(card.card_number)}) | 余额: ${card.available_balance:.2f}"
         )
         return card
 
@@ -452,9 +490,6 @@ class Acquirer:
         card_region = issuer.region
         region_cn = REGION_NAMES.get(card_region, card_region)
 
-        # 【核心机制：收单行 BIN 归属地合规拦截】
-        # 尽管中国大陆(CN)和香港(HK)的银行发行的也是正规 Visa 卡，但若商户因政策原因禁止接收这些地区的付款，
-        # 收单行(Stripe)通过查 BIN 表识别出发卡地区为 CN 或 HK 后，连 VisaNet 都不会发，直接在收单层拦截！
         if merchant.blocked_regions and card_region in merchant.blocked_regions:
             print(
                 f"  🚫 [{self.name} · 地区政策拦截] 识别卡号前6位 BIN={card_number[:6]} "
@@ -500,7 +535,7 @@ class Acquirer:
 
 
 class Merchant:
-    """商户（可配置 blocked_regions 模拟对特定国家/地区发卡行的政策限制）"""
+    """商户"""
 
     def __init__(
         self,
