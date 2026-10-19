@@ -3,12 +3,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CardTierConfig:
-    """卡片类型与费率配置（传统银行卡或虚拟卡平台卡种）"""
+    """卡片类型与 BIN 元数据配置"""
 
     tier_code: str
     display_name: str
     bin_prefix: str
-    region: str                   # 发卡行国家/地区代码: "CN"(中国大陆) | "HK"(中国香港) | "US"(美国)
+    region: str                   # 发卡国家/地区代码: "CN" | "HK" | "PR"(美属波多黎各) | "US"(美国本土)
+    funding_type: str = "credit"  # 卡片资金属性: "credit"(信用卡) | "debit"(借记卡) | "prepaid"(预付卡/U卡)
     open_fee: float = 0.0
     tx_fee_rate: float = 0.0
     decline_fee: float = 0.0
@@ -19,7 +20,7 @@ class CardTierConfig:
 
 @dataclass
 class VirtualCard:
-    """银行卡实体（支持传统银行直发 Visa 卡 & 虚拟卡平台生成的子卡）"""
+    """银行卡实体"""
 
     card_number: str
     cvv: str
@@ -64,7 +65,6 @@ class AuthRequest:
     mcc: str = "5734"
     tx_minute: int = 0
     require_3ds: bool = False
-    # --- VisaNet 在路由途中实时计算并塞入报文的 VAA 风险分 ---
     vaa_score: int = 0
     vaa_reasons: list[str] = field(default_factory=list)
 
@@ -74,7 +74,7 @@ class AuthResponse:
     """T+0 交易授权响应报文"""
 
     approved: bool
-    code: str         # "00" 成功，"51" 余额不足，"14" 卡号无效，"N7" CVV错误，"62" 政策地区限制/冻结，"59" VAA反欺诈拦截
+    code: str
     message: str
     auth_id: str = ""
 

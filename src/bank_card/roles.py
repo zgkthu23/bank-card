@@ -13,7 +13,8 @@ from bank_card.models import (
 REGION_NAMES = {
     "CN": "中国大陆",
     "HK": "中国香港",
-    "US": "美国(含美属波多黎各PR)",
+    "PR": "美属波多黎各(离岸金融区)",
+    "US": "美国本土",
     "RU": "俄罗斯",
 }
 
@@ -21,7 +22,6 @@ REGION_NAMES = {
 def calculate_luhn_check_digit(partial_15_digits: str) -> str:
     """根据前 15 位数字，使用 Luhn (模10) 算法计算第 16 位校验位"""
     total = 0
-    # 从右往左，奇数位(即倒数第1、3、5...位，对应15位中的偶数索引)乘以 2
     for idx, ch in enumerate(reversed(partial_15_digits)):
         d = int(ch)
         if idx % 2 == 0:
@@ -40,7 +40,7 @@ def verify_luhn(card_number: str) -> bool:
 class CardNetwork:
     """全球支付网络 / 卡组织（如 VisaNet）"""
 
-    SCHEME_FEE_RATE = 0.0015  # 卡组织网络费率：0.15%
+    SCHEME_FEE_RATE = 0.0015
 
     def __init__(self, name: str = "VisaNet"):
         self.name = name
@@ -53,12 +53,11 @@ class CardNetwork:
         issuer.bin_prefix = bin_prefix
         region_cn = REGION_NAMES.get(issuer.region, issuer.region)
         print(
-            f"[{self.name}] 已将 BIN [{bin_prefix}] ({region_cn}/{issuer.region} · {issuer.scheme}) "
+            f"[{self.name}] 已将 BIN [{bin_prefix}] ({region_cn}/{issuer.region} · {issuer.scheme} · {issuer.default_funding}) "
             f"分配给发卡行: {issuer.name}"
         )
 
     def get_issuer_by_bin(self, card_number: str) -> "IssuerBank | None":
-        """通过卡号前 6 位（BIN）查询背后的发卡行及其所在国家/地区"""
         return self.bin_table.get(card_number[:6])
 
     @staticmethod
@@ -66,7 +65,6 @@ class CardNetwork:
         return hashlib.sha256(card_number.encode()).hexdigest()[:12]
 
     def _evaluate_and_inject_vaa(self, req: AuthRequest) -> CardBehavioralProfile:
-        """【VAA 实时反欺诈评分计算】"""
         pan_hash = self._hash_pan(req.card_number)
         masked = f"{req.card_number[:6]}******{req.card_number[-4:]}"
         profile = self.behavioral_profiles.get(pan_hash)
@@ -166,20 +164,17 @@ class CardNetwork:
 
 
 class IssuerBank:
-    """
-    持牌发卡银行（支持两种模式）：
-    1. 传统直连银行模式（如中国大陆的招商银行/中国银行、中国香港的汇丰银行）
-    2. BaaS 合作发卡行模式（如美属波多黎各 Banco San Juan Internacional）：将 BIN 454924 租给 Roogoo
-    """
+    """持牌发卡银行"""
 
     INTERCHANGE_FEE_RATE = 0.0175
     BIN_SUSPEND_THRESHOLD = 3
     VAA_BLOCK_THRESHOLD = 80
 
-    def __init__(self, name: str, region: str, scheme: str = "Visa"):
+    def __init__(self, name: str, region: str, scheme: str = "Visa", default_funding: str = "credit"):
         self.name = name
-        self.region = region  # "CN"(中国大陆) | "HK"(中国香港) | "US"(美国/美属波多黎各)
+        self.region = region                # "CN" | "HK" | "PR"(美属波多黎各) | "US"(美国本土)
         self.scheme = scheme
+        self.default_funding = default_funding  # "credit"(信用卡) | "prepaid"(预付虚拟卡)
         self.bin_prefix: str = ""
         self.cards: dict[str, VirtualCard] = {}
         self.baas_platform = None
@@ -188,7 +183,6 @@ class IssuerBank:
         self.bin_suspended: bool = False
 
     def issue_direct_card(self, owner: str, initial_balance: float, card_name: str = "") -> VirtualCard:
-        """【传统银行直发模式】"""
         region_cn = REGION_NAMES.get(self.region, self.region)
         display_name = card_name or f"{self.name}·{self.scheme}卡({region_cn})"
         tier = CardTierConfig(
@@ -196,6 +190,7 @@ class IssuerBank:
             display_name=display_name,
             bin_prefix=self.bin_prefix,
             region=self.region,
+            funding_type=self.default_funding,
             open_fee=0.0,
             tx_fee_rate=0.0,
             support_3ds=True,
@@ -205,7 +200,7 @@ class IssuerBank:
         )
         print(
             f"[{self.name} 直发卡成功] 持卡人: {owner} | 卡名: {display_name} | "
-            f"卡号: {card.card_number} (BIN:{self.bin_prefix}·{self.region} | Luhn校验:{verify_luhn(card.card_number)}) | 额度: ${initial_balance:.2f}"
+            f"卡号: {card.card_number} (BIN:{self.bin_prefix}·{self.region}·{self.default_funding} | Luhn:{verify_luhn(card.card_number)})"
         )
         return card
 
@@ -290,9 +285,10 @@ class RoogooPlatform:
     CARD_TIERS: dict[str, CardTierConfig] = {
         "ENJOY": CardTierConfig(
             tier_code="ENJOY",
-            display_name="Roogoo·乐享卡(真实卡段454924·波多黎各BSJI)",
+            display_name="Roogoo·乐享卡(真实卡段454924·波多黎各Prepaid预付卡)",
             bin_prefix="454924",
-            region="US",
+            region="PR",            # 真实 BIN 归属地为 PR (Puerto Rico 美属波多黎各)
+            funding_type="prepaid", # 真实 BIN 卡片性质为 Prepaid (预付卡)
             open_fee=0.0,
             tx_fee_rate=0.01,
             decline_fee=0.50,
@@ -301,9 +297,10 @@ class RoogooPlatform:
         ),
         "PREMIER": CardTierConfig(
             tier_code="PREMIER",
-            display_name="Roogoo·尊享卡(香港Visa虚拟卡)",
+            display_name="Roogoo·尊享卡(香港538720·Prepaid预付卡)",
             bin_prefix="538720",
             region="HK",
+            funding_type="prepaid",
             open_fee=4.99,
             tx_fee_rate=0.016,
             decline_fee=1.00,
@@ -353,8 +350,8 @@ class RoogooPlatform:
         )
         print(
             f"[{self.name} 开卡成功] 持卡人: {card.owner} | 卡种: {tier.display_name}\n"
-            f"  └─ 卡号: {card.card_number} (6位BIN:{card.card_number[:6]} | 8位BIN:{card.card_number[:8]} | "
-            f"Luhn校验通过:{verify_luhn(card.card_number)}) | 余额: ${card.available_balance:.2f}"
+            f"  └─ 卡号: {card.card_number} (6位BIN:{card.card_number[:6]} | 地区:{tier.region} | "
+            f"属性:{tier.funding_type} | Luhn:{verify_luhn(card.card_number)}) | 余额: ${card.available_balance:.2f}"
         )
         return card
 
@@ -388,7 +385,7 @@ class RoogooPlatform:
 
 
 class SuPayPlatform:
-    """SuPay 平台（免实名 No-KYC 企业采购子卡分销台）"""
+    """SuPay 平台（免实名 No-KYC 企业商务信用卡 Credit 卡段）"""
 
     CORPORATE_ENTITY = "SuPay Global Ads LLC"
     DEPOSIT_FEE_RATE = 0.02
@@ -396,9 +393,10 @@ class SuPayPlatform:
     CARD_TIERS: dict[str, CardTierConfig] = {
         "SUPAY_MC": CardTierConfig(
             tier_code="SUPAY_MC",
-            display_name="SuPay·万事达免实名卡(美国企业卡段)",
+            display_name="SuPay·美国本土企业商务信用卡(556789·US·Credit)",
             bin_prefix="556789",
-            region="US",
+            region="US",            # 纯正美国本土银行 Cross River Bank
+            funding_type="credit",  # 企业商务信用卡 (Commercial Credit)，非 Prepaid！
             open_fee=8.00,
             tx_fee_rate=0.0,
             decline_fee=0.0,
@@ -438,7 +436,7 @@ class SuPayPlatform:
         )
         print(
             f"[{self.name} 免KYC开卡成功] 邮箱: {email} | 卡种: {tier.display_name} | "
-            f"卡号: {card.card_number} (BIN:{tier.bin_prefix}·{tier.region}) | 余额: ${card.available_balance:.2f}"
+            f"卡号: {card.card_number} (BIN:{tier.bin_prefix}·{tier.region}·{tier.funding_type}) | 余额: ${card.available_balance:.2f}"
         )
         return card
 
@@ -457,7 +455,14 @@ class SuPayPlatform:
 
 
 class Acquirer:
-    """收单机构（如 Stripe：负责在进入 VisaNet 前执行商户的地区合规政策过滤）"""
+    """
+    收单机构（如 Stripe）
+    内置【Stripe Radar 风控规则引擎】，可在把报文发给 VisaNet 之前，根据：
+    1. 发卡国家/地区 (blocked_regions)
+    2. 卡片资金属性 (block_prepaid: 是否封杀 Prepaid 预付虚拟卡)
+    3. 高危网红虚拟卡段黑名单 (blacklisted_bins: 如被大量滥用的 454924 等)
+    直接拦截交易，并向前端统一展示模糊报错："Your card has been declined."
+    """
 
     def __init__(self, name: str, network: CardNetwork):
         self.name = name
@@ -467,12 +472,15 @@ class Acquirer:
 
     def register_merchant(self, merchant: "Merchant") -> None:
         self.merchant_accounts[merchant.name] = MerchantStripeAccount(merchant_name=merchant.name)
+        rules = []
         if merchant.blocked_regions:
-            blocked_desc = ", ".join(f"{REGION_NAMES.get(r, r)}({r})" for r in merchant.blocked_regions)
-            policy_str = f"政策禁入地区: [{blocked_desc}]"
-        else:
-            policy_str = "无地区限制（支持全球 Visa/MC 卡）"
-        print(f"[{self.name}] 已为商户 [{merchant.name}] 开通收单服务 | 合规策略: {policy_str}")
+            rules.append(f"禁入地区:{merchant.blocked_regions}")
+        if merchant.block_prepaid:
+            rules.append("拦截Prepaid预付卡")
+        if merchant.blacklisted_bins:
+            rules.append(f"封禁高危虚拟卡BIN:{merchant.blacklisted_bins}")
+        rule_str = " | ".join(rules) if rules else "全球无限制"
+        print(f"[{self.name}] 已为商户 [{merchant.name}] 开通收单服务 | Stripe Radar 规则: {rule_str}")
 
     def process_payment(
         self,
@@ -483,24 +491,49 @@ class Acquirer:
         amount: float,
         tx_minute: int = 0,
     ) -> AuthResponse:
+        bin_prefix = card_number[:6]
         issuer = self.network.get_issuer_by_bin(card_number)
         if not issuer:
-            return AuthResponse(approved=False, code="14", message="未知的卡号 BIN")
+            return AuthResponse(approved=False, code="14", message="Your card has been declined (invalid_number)")
 
         card_region = issuer.region
         region_cn = REGION_NAMES.get(card_region, card_region)
+        funding_type = issuer.default_funding
 
+        # 规则 1：地区合规拦截 (如 CN/HK，或者严格区分美属波多黎各 PR 与美国本土 US)
         if merchant.blocked_regions and card_region in merchant.blocked_regions:
             print(
-                f"  🚫 [{self.name} · 地区政策拦截] 识别卡号前6位 BIN={card_number[:6]} "
-                f"所属发卡行为 [{issuer.name}]，发卡地为 【{region_cn} ({card_region})】！\n"
-                f"     原因：尽管这是合法的 {issuer.scheme} 卡，但商户 [{merchant.name}] 受合规政策限制，"
-                f"拒收来自 {region_cn}({card_region}) 地区发行的银行卡 (decline_code: country_not_supported)！"
+                f"  🚫 [{self.name} Radar · 地区政策拦截] BIN={bin_prefix} 发卡行为 [{issuer.name}]，发卡地为 【{region_cn} ({card_region})】！\n"
+                f"     商户 [{merchant.name}] 拒收来自 {merchant.blocked_regions} 的银行卡 (Stripe 内部码: country_not_supported)"
             )
             return AuthResponse(
                 approved=False,
                 code="62",
-                message=f"政策限制拒付 (country_not_supported): 商户不支持 {region_cn}({card_region}) 发行的 {issuer.scheme} 卡",
+                message=f"Your card has been declined. (原因: 商户政策禁入 {region_cn}[{card_region}])",
+            )
+
+        # 规则 2：Anthropic 等严苛商户专门针对【高危虚拟卡 BIN 黑名单】或【Prepaid 预付卡属性】的拦截
+        if merchant.blacklisted_bins and bin_prefix in merchant.blacklisted_bins:
+            print(
+                f"  🚫 [{self.name} Radar · 虚拟卡段黑名单拦截] 命中高危虚拟卡 BIN [{bin_prefix}] ({issuer.name})！\n"
+                f"     内部原因：该波多黎各离岸卡段 ({bin_prefix}) 被大量用户集中用于注册 AI 账号，已被 [{merchant.name}] 列入 BIN 黑名单！\n"
+                f"     注意：请求在 Stripe 层直接被掐断，根本未发往 VisaNet 和 Roogoo，前端仅显示 'Your card has been declined.'"
+            )
+            return AuthResponse(
+                approved=False,
+                code="62",
+                message=f"Your card has been declined. (Stripe Radar 内部拦截: 虚拟卡 BIN [{bin_prefix}] 已被拉黑)",
+            )
+
+        if merchant.block_prepaid and funding_type == "prepaid":
+            print(
+                f"  🚫 [{self.name} Radar · 卡片属性拦截] 识别到 BIN={bin_prefix} 的资金属性为 【Prepaid (预付充值卡)】！\n"
+                f"     商户 [{merchant.name}] 启用了 'Block Prepaid Cards' 规则，仅允许 Credit(信用卡) 或 Debit(借记卡) 绑定订阅！"
+            )
+            return AuthResponse(
+                approved=False,
+                code="62",
+                message="Your card has been declined. (Stripe Radar 内部拦截: 拒绝 Prepaid 预付属性虚拟卡)",
             )
 
         req = AuthRequest(
@@ -535,7 +568,7 @@ class Acquirer:
 
 
 class Merchant:
-    """商户"""
+    """商户（可配置地区黑名单、是否拦截 Prepaid 预付卡、以及特定虚拟卡 BIN 黑名单）"""
 
     def __init__(
         self,
@@ -544,6 +577,8 @@ class Merchant:
         country: str = "US",
         mcc: str = "5734",
         blocked_regions: list[str] | None = None,
+        block_prepaid: bool = False,
+        blacklisted_bins: list[str] | None = None,
         require_3ds: bool = False,
     ):
         self.name = name
@@ -551,6 +586,8 @@ class Merchant:
         self.country = country
         self.mcc = mcc
         self.blocked_regions = blocked_regions
+        self.block_prepaid = block_prepaid
+        self.blacklisted_bins = blacklisted_bins
         self.require_3ds = require_3ds
         self.corporate_bank_balance: float = 0.0
         acquirer.register_merchant(self)
