@@ -11,71 +11,93 @@ from bank_card.roles import (
 
 def main() -> None:
     print("================================================================================")
-    print("  阶段 1：刚开出虚拟卡时，VisaNet 的大数据画像库里有什么？（验证信息隔离）")
+    print("  阶段 1：构建全球清算网 —— 接入中国大陆(CN)、中国香港(HK)与美国(US)发卡行")
     print("================================================================================")
     visa_net = CardNetwork("VisaNet")
-    us_bank = IssuerBank("美国波多黎各发卡行(Sutton Bank)", region="US", scheme="Visa")
-    corp_bank = IssuerBank("美国商业发卡行(Cross River Bank)", region="US", scheme="Mastercard")
-    visa_net.register_issuer("428800", us_bank)
-    visa_net.register_issuer("556789", corp_bank)
 
+    # 1. 中国大陆(CN) 持牌发行 Visa 卡的商业银行
+    cmb_cn_bank = IssuerBank("招商银行(CMB)", region="CN", scheme="Visa")
+    boc_cn_bank = IssuerBank("中国银行(Bank of China)", region="CN", scheme="Visa")
+    visa_net.register_issuer("439225", cmb_cn_bank)
+    visa_net.register_issuer("409666", boc_cn_bank)
+
+    # 2. 中国香港(HK) 持牌发行 Visa 卡的商业银行与虚拟卡合作行
+    hsbc_hk_bank = IssuerBank("香港汇丰银行(HSBC HK)", region="HK", scheme="Visa")
+    za_hk_bank = IssuerBank("香港众安/发卡行(HK Sponsor Bank)", region="HK", scheme="Visa")
+    visa_net.register_issuer("451420", hsbc_hk_bank)
+    visa_net.register_issuer("538720", za_hk_bank)
+
+    # 3. 美国(US) 虚拟卡平台背后的持牌合作发卡行 (BIN Sponsor)
+    us_sutton_bank = IssuerBank("美国波多黎各发卡行(Sutton Bank)", region="US", scheme="Visa")
+    us_cross_river_bank = IssuerBank("美国商业发卡行(Cross River Bank)", region="US", scheme="Mastercard")
+    visa_net.register_issuer("428800", us_sutton_bank)
+    visa_net.register_issuer("556789", us_cross_river_bank)
+
+    # 虚拟卡平台接入上游银行
     roogoo = RoogooPlatform("Roogoo 平台")
-    roogoo.connect_sponsor_bank(us_bank)
+    roogoo.connect_sponsor_bank(us_sutton_bank)
+    roogoo.connect_sponsor_bank(za_hk_bank)
+
     supay = SuPayPlatform("SuPay 平台")
-    supay.connect_sponsor_bank(corp_bank)
+    supay.connect_sponsor_bank(us_cross_river_bank)
 
-    # Alice 在 Roogoo 实名开了一张 $500 额度的虚拟卡；Bob 在 SuPay 匿名开了一张 $100 的卡
-    alice = User("Alice")
-    roogoo.complete_kyc("Alice")
-    roogoo.deposit_usdt("Alice", 500.0)
-    alice_card = roogoo.open_card("Alice", "ENJOY", load_amount=500.0)
-
-    bob = User("bob@anon.me")
-    supay.deposit_usdt("bob@anon.me", 110.0)
-    bob_unused_card = supay.open_card("bob@anon.me", "SUPAY_MC", load_amount=90.0)
-
-    # 重点观察：此时两张卡都已经生成，但从来没刷过，看看 VisaNet 的数据库里有没有它们？
-    visa_net.print_card_profiles()
-
-    print("\n================================================================================")
-    print("  阶段 2：Alice 正常订阅软件 —— 报文路过 VisaNet，逐步沉淀《卡片历史行为画像》")
-    print("================================================================================")
+    # 初始化收单行 Stripe 与不同地区政策的海外商户
     stripe = Acquirer("Stripe 收单行", visa_net)
-    openai = Merchant("OpenAI (美国软件商)", stripe, country="US", mcc="5734")
-    cursor = Merchant("Cursor AI (美国软件商)", stripe, country="US", mcc="5734")
+    # 普通国际商户（如 Steam / 亚马逊）：只要是 Visa 卡，无论中国大陆、香港还是美国发行的全都欢迎！
+    steam = Merchant("Steam 游戏商城 (全球开放商户)", stripe, country="US", mcc="5734", blocked_regions=None)
+    # 政策受限商户（如 OpenAI / Claude）：虽然同样接了 Visa，但受合规政策影响，严禁接收 CN(中国大陆) 和 HK(中国香港) 银行卡的付款！
+    openai = Merchant(
+        "OpenAI (受政策限制的AI商户)",
+        stripe,
+        country="US",
+        mcc="5734",
+        blocked_regions=["CN", "HK", "RU"],
+    )
     moscow_gift = Merchant("莫斯科数字礼品卡店 (高危洗钱品类)", stripe, country="RU", mcc="5999")
 
-    # 第 1 次刷卡 (T+10 分钟)：Alice 在美国 OpenAI 消费 $20
-    alice.pay(openai, alice_card, amount=20.0, tx_minute=10)
+    print("\n================================================================================")
+    print("  阶段 2：真实痛点还原 —— 为什么有招行/中行/香港汇丰的 Visa 卡，却付不了 OpenAI？")
+    print("================================================================================")
+    alice = User("Alice")
+    # Alice 本来就有中国大陆和香港正规银行发行的 Visa 卡（0开卡费、0平台手续费）
+    cmb_visa = cmb_cn_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="招商银行全币种国际Visa卡(CN)")
+    boc_visa = boc_cn_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="中国银行长城卓隽留学Visa卡(CN)")
+    hsbc_hk_visa = hsbc_hk_bank.issue_direct_card("Alice", initial_balance=1000.0, card_name="香港汇丰银行Pulse Visa卡(HK)")
 
-    # 第 2 次刷卡 (T+120 分钟，约2小时后)：Alice 在美国 Cursor 消费 $20
-    alice.pay(cursor, alice_card, amount=20.0, tx_minute=120)
+    print("\n--- [测试 A] 在无政策限制的国际商户 (Steam) 刷中国大陆与香港的 Visa 卡 ---")
+    alice.pay(steam, cmb_visa, amount=30.0, tx_minute=1)
+    alice.pay(steam, hsbc_hk_visa, amount=30.0, tx_minute=5)
 
-    # 再次查看 VisaNet 的大数据画像库（对比：Alice 的卡已建立美国常驻画像，而没刷过的 Bob 卡依然隐形）
-    visa_net.print_card_profiles()
+    print("\n--- [测试 B] 拿同样的中国大陆(招行/中行)与香港(汇丰) Visa 卡去付 OpenAI ---")
+    alice.pay(openai, cmb_visa, amount=20.0, tx_minute=6)
+    alice.pay(openai, boc_visa, amount=20.0, tx_minute=7)
+    alice.pay(openai, hsbc_hk_visa, amount=20.0, tx_minute=8)
 
     print("\n================================================================================")
-    print("  阶段 3：黑客盗取 Alice 完整卡号与正确 CVV ➔ 触发 Visa VAA 毫秒级反欺诈熔断")
+    print("  阶段 3：借道破局 —— 为什么必须用虚拟卡平台的【美国卡段 (US BIN)】？")
     print("================================================================================")
-    print(
-        f"🕵️ [黑客视角] 已通过木马窃取 Alice 卡号 {alice_card.card_number} 与正确 CVV ({alice_card.cvv})，"
-        f"此时卡内仍有巨额可用余额 ${alice_card.available_balance:.2f}！"
-    )
+    roogoo.complete_kyc("Alice")
+    roogoo.deposit_usdt("Alice", 600.0)
+    # 如果在 Roogoo 开的是【香港卡段 (538720·HK)】虚拟卡，去付 OpenAI 照样会被政策拦截！
+    roogoo_hk_card = roogoo.open_card("Alice", "PREMIER", load_amount=50.0)
+    alice.pay(openai, roogoo_hk_card, amount=20.0, tx_minute=9)
 
-    # 黑客第 1 步 (T+125 分钟)：先在某美国网站刷一笔 $1.00 小额探卡，测试卡片是否存活
-    print("\n--- 🕵️ 黑客第 1 步 (T+125m)：发起 $1.00 小额探卡测试 (Carding Probe) ---")
-    openai.checkout(alice_card.card_number, alice_card.cvv, alice_card.expiry, amount=1.0, tx_minute=125)
+    # 只有开通底层挂靠在美国银行 (Sutton Bank) 的【美国卡段 (428800·US)】虚拟卡，才能绕过 CN/HK 政策封锁！
+    roogoo_us_card = roogoo.open_card("Alice", "ENJOY", load_amount=500.0)
+    alice.pay(openai, roogoo_us_card, amount=20.0, tx_minute=10)
+    alice.pay(openai, roogoo_us_card, amount=20.0, tx_minute=120)
 
-    # 黑客第 2 步 (T+128 分钟，仅隔 3 分钟！)：确认卡存活后，立即在俄罗斯礼品卡网站盗刷 $300.00！
-    print("\n--- 🕵️ 黑客第 2 步 (T+128m，仅隔3分钟)：在俄罗斯商户发起 $300.00 大额礼品卡盗刷 ---")
-    moscow_gift.checkout(alice_card.card_number, alice_card.cvv, alice_card.expiry, amount=300.0, tx_minute=128)
-
-    # 最终查看 VisaNet 的画像库与 Alice 的幸存余额
+    print("\n================================================================================")
+    print("  阶段 4：VisaNet VAA 卡片历史行为画像库与黑客跨国盗刷熔断拦截")
+    print("================================================================================")
     visa_net.print_card_profiles()
+
     print(
-        f"\n✅ 最终结果：尽管黑客掌握了 100% 正确的卡号、有效期与 CVV，且卡内有 ${alice_card.available_balance:.2f}，"
-        f"但凭借 VisaNet 注入报文的 VAA 风险分(99分)，发卡行成功保住了 Alice 的 $300.00！"
+        f"\n🕵️ [黑客视角] 窃取了 Alice 的美国虚拟卡 {roogoo_us_card.card_number} 与正确 CVV ({roogoo_us_card.cvv})，"
+        f"先在 T+125m 发起 $1 小额探卡，随后在 T+128m (仅隔3分钟) 跨国在俄罗斯盗刷 $300："
     )
+    openai.checkout(roogoo_us_card.card_number, roogoo_us_card.cvv, roogoo_us_card.expiry, amount=1.0, tx_minute=125)
+    moscow_gift.checkout(roogoo_us_card.card_number, roogoo_us_card.cvv, roogoo_us_card.expiry, amount=300.0, tx_minute=128)
 
 
 if __name__ == "__main__":
