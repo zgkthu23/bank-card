@@ -1,0 +1,26 @@
+[project]
+name = "bank-card"
+version = "0.1.0"
+description = "A minimal educational simulator of virtual cards and global payment networks (Visa/Four-Party Model)"
+readme = "README.md"
+authors = [
+    { name = "zgk", email = "zgkthu23@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+bank-card = "bank_card:main"
+
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+python-preference = "only-system"
+
+[dependency-groups]
+dev = [
+    "pudb>=2026.1",
+]
+
