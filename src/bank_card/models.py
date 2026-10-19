@@ -35,6 +35,16 @@ class VirtualCard:
 
 
 @dataclass
+class AppleGiftCard:
+    """美区 Apple Gift Card 电子礼品卡（可通过支付宝小程序购买）"""
+
+    code: str            # 16位兑换码，如 "ALIPAY-AGC-8899"
+    face_value: float    # 面值 ($20.00)
+    region: str = "US"   # 适用苹果商店地区 ("US" 美区)
+    redeemed: bool = False
+
+
+@dataclass
 class CardBehavioralProfile:
     """【VisaNet 大数据风控集群：卡片历史行为画像库】"""
 

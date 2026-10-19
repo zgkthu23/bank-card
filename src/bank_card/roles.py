@@ -1,6 +1,7 @@
 import hashlib
 import random
 from bank_card.models import (
+    AppleGiftCard,
     AuthRequest,
     AuthResponse,
     CardBehavioralProfile,
@@ -172,9 +173,9 @@ class IssuerBank:
 
     def __init__(self, name: str, region: str, scheme: str = "Visa", default_funding: str = "credit"):
         self.name = name
-        self.region = region                # "CN" | "HK" | "PR"(美属波多黎各) | "US"(美国本土)
+        self.region = region
         self.scheme = scheme
-        self.default_funding = default_funding  # "credit"(信用卡) | "prepaid"(预付虚拟卡)
+        self.default_funding = default_funding
         self.bin_prefix: str = ""
         self.cards: dict[str, VirtualCard] = {}
         self.baas_platform = None
@@ -280,15 +281,15 @@ class IssuerBank:
 
 
 class RoogooPlatform:
-    """Roogoo 平台（个人实名 KYC 消费 U 卡）"""
+    """Roogoo 平台（个人实名 KYC 消费 U 卡，带手机 App 交易账单日志）"""
 
     CARD_TIERS: dict[str, CardTierConfig] = {
         "ENJOY": CardTierConfig(
             tier_code="ENJOY",
             display_name="Roogoo·乐享卡(真实卡段454924·波多黎各Prepaid预付卡)",
             bin_prefix="454924",
-            region="PR",            # 真实 BIN 归属地为 PR (Puerto Rico 美属波多黎各)
-            funding_type="prepaid", # 真实 BIN 卡片性质为 Prepaid (预付卡)
+            region="PR",
+            funding_type="prepaid",
             open_fee=0.0,
             tx_fee_rate=0.01,
             decline_fee=0.50,
@@ -317,6 +318,8 @@ class RoogooPlatform:
         self.user_usd_wallets: dict[str, float] = {}
         self.kyc_users: set[str] = set()
         self.revenue: float = 0.0
+        # 模拟用户在 Roogoo 手机 App 里能看到的卡片交易流水（只有请求真正到达 Roogoo 才会留下记录！）
+        self.app_transaction_logs: dict[str, list[str]] = {}
 
     def connect_sponsor_bank(self, bank: IssuerBank) -> None:
         self.sponsor_banks[bank.bin_prefix] = bank
@@ -348,6 +351,9 @@ class RoogooPlatform:
             initial_balance=load_amount,
             custom_card_number=custom_card_number,
         )
+        self.app_transaction_logs.setdefault(card.card_number, []).append(
+            f"[开卡充值] 初始转入 +${load_amount:.2f} | 当前可用余额: ${card.available_balance:.2f}"
+        )
         print(
             f"[{self.name} 开卡成功] 持卡人: {card.owner} | 卡种: {tier.display_name}\n"
             f"  └─ 卡号: {card.card_number} (6位BIN:{card.card_number[:6]} | 地区:{tier.region} | "
@@ -356,7 +362,9 @@ class RoogooPlatform:
         return card
 
     def handle_auth_webhook(self, card: VirtualCard, req: AuthRequest) -> AuthResponse:
+        logs = self.app_transaction_logs.setdefault(card.card_number, [])
         if card.is_frozen:
+            logs.append(f"[交易被拒·卡片已冻结] 商户: {req.merchant_name} | 金额: ${req.amount:.2f}")
             return AuthResponse(approved=False, code="62", message="卡片已被风控冻结")
 
         roogoo_tx_fee = round(req.amount * card.tier.tx_fee_rate, 2)
@@ -369,6 +377,10 @@ class RoogooPlatform:
             self.revenue = round(self.revenue + penalty, 2)
             if card.decline_count >= self.MAX_DECLINE_LIMIT:
                 card.is_frozen = True
+            logs.append(
+                f"[❌ 交易失败·余额不足] 商户: {req.merchant_name} (${req.amount:.2f}) | "
+                f"扣除拒付罚金: -${penalty:.2f} | 余额: ${card.available_balance:.2f}"
+            )
             return AuthResponse(approved=False, code="51", message=f"余额不足，已扣拒付罚金 ${penalty:.2f}")
 
         card.decline_count = 0
@@ -377,96 +389,86 @@ class RoogooPlatform:
         self.revenue = round(self.revenue + roogoo_tx_fee, 2)
 
         auth_id = f"AUTH-{random.randint(1000, 9999)}"
+        logs.append(
+            f"[✅ 消费授权成功({auth_id})] 商户: {req.merchant_name} | 消费: -${req.amount:.2f} | "
+            f"手续费: -${roogoo_tx_fee:.2f} | 余额: ${card.available_balance:.2f}"
+        )
         print(
             f"  <- [{self.name} 授权通过({auth_id})] 冻结消费 ${req.amount:.2f} + "
             f"平台加收手续费({card.tier.tx_fee_rate * 100:.1f}%) ${roogoo_tx_fee:.2f} | 剩: ${card.available_balance:.2f}"
         )
         return AuthResponse(approved=True, code="00", message="Approved", auth_id=auth_id)
 
-
-class SuPayPlatform:
-    """SuPay 平台（免实名 No-KYC 企业商务信用卡 Credit 卡段）"""
-
-    CORPORATE_ENTITY = "SuPay Global Ads LLC"
-    DEPOSIT_FEE_RATE = 0.02
-
-    CARD_TIERS: dict[str, CardTierConfig] = {
-        "SUPAY_MC": CardTierConfig(
-            tier_code="SUPAY_MC",
-            display_name="SuPay·美国本土企业商务信用卡(556789·US·Credit)",
-            bin_prefix="556789",
-            region="US",            # 纯正美国本土银行 Cross River Bank
-            funding_type="credit",  # 企业商务信用卡 (Commercial Credit)，非 Prepaid！
-            open_fee=8.00,
-            tx_fee_rate=0.0,
-            decline_fee=0.0,
-            support_3ds=False,
-            require_kyc=False,
-        ),
-    }
-
-    def __init__(self, name: str = "SuPay 平台"):
-        self.name = name
-        self.sponsor_banks: dict[str, IssuerBank] = {}
-        self.user_usd_wallets: dict[str, float] = {}
-        self.revenue: float = 0.0
-
-    def connect_sponsor_bank(self, bank: IssuerBank) -> None:
-        self.sponsor_banks[bank.bin_prefix] = bank
-        bank.baas_platform = self
-
-    def deposit_usdt(self, email: str, usdt_amount: float) -> None:
-        deposit_fee = round(usdt_amount * self.DEPOSIT_FEE_RATE, 2)
-        net_usd = round(usdt_amount - deposit_fee, 2)
-        self.revenue = round(self.revenue + deposit_fee, 2)
-        self.user_usd_wallets[email] = round(self.user_usd_wallets.get(email, 0.0) + net_usd, 2)
-
-    def open_card(self, email: str, tier_code: str, load_amount: float) -> VirtualCard:
-        tier = self.CARD_TIERS[tier_code]
-        total_cost = round(tier.open_fee + load_amount, 2)
-        self.user_usd_wallets[email] = round(self.user_usd_wallets[email] - total_cost, 2)
-        self.revenue = round(self.revenue + tier.open_fee, 2)
-
-        sponsor_bank = self.sponsor_banks[tier.bin_prefix]
-        card = sponsor_bank.create_card_record(
-            owner=self.CORPORATE_ENTITY,
-            user_label=email,
-            tier=tier,
-            initial_balance=load_amount,
-        )
+    def print_app_bill(self, card: VirtualCard) -> None:
+        """模拟用户打开 Roogoo 手机 App 查看该卡的交易记录与拒付费扣除情况"""
+        print(f"\n📱 --- 【用户打开 Roogoo 手机 App 查看卡 {card.card_number} 账单明细】 ---")
+        for idx, entry in enumerate(self.app_transaction_logs.get(card.card_number, []), 1):
+            print(f"  {idx}. {entry}")
         print(
-            f"[{self.name} 免KYC开卡成功] 邮箱: {email} | 卡种: {tier.display_name} | "
-            f"卡号: {card.card_number} (BIN:{tier.bin_prefix}·{tier.region}·{tier.funding_type}) | 余额: ${card.available_balance:.2f}"
+            "  💡 [App 账单结论] 没有任何来自 Anthropic Claude Code 的失败交易记录，也未扣 $0.50 拒付费！\n"
+            "     原因：请求在第一关 (Stripe Radar) 就被短路拦截了，根本没有穿过 VisaNet 到达 Roogoo 服务器！"
         )
-        return card
 
-    def handle_auth_webhook(self, card: VirtualCard, req: AuthRequest) -> AuthResponse:
-        if card.available_balance < req.amount:
-            return AuthResponse(approved=False, code="51", message="余额不足")
 
-        card.available_balance = round(card.available_balance - req.amount, 2)
-        card.frozen_balance = round(card.frozen_balance + req.amount, 2)
-        auth_id = f"AUTH-{random.randint(1000, 9999)}"
+class StripeRadar:
+    """
+    【Stripe Radar 独立风控引擎】
+    部署在 Stripe 收单行最前端（进入 VisaNet 之前）。
+    它自带全球 BIN 本地缓存表，可在几毫秒内直接识别：
+    - 发卡国家/地区 (CN / HK / PR 波多黎各 / US 美国本土)
+    - 卡片资金类型 (credit 信用卡 / debit 借记卡 / prepaid 预付充值卡)
+    - 高风险虚拟卡 BIN 黑名单 (如 454924 等高频用于 AI 订阅的 U 卡号段)
+    一旦命中拦截规则，直接在 Stripe 层短路返回 "Your card has been declined."，不发往 VisaNet！
+    """
+
+    def inspect(self, merchant: "Merchant", card_number: str, issuer: IssuerBank | None) -> tuple[bool, str]:
+        if not issuer:
+            return False, "Your card has been declined. (invalid_number)"
+
+        bin_prefix = card_number[:6]
+        card_region = issuer.region
+        region_cn = REGION_NAMES.get(card_region, card_region)
+        funding_type = issuer.default_funding
+
+        # 1. 检查发卡国家/地区政策禁入 (如 CN、HK、RU)
+        if merchant.blocked_regions and card_region in merchant.blocked_regions:
+            print(
+                f"  🚫 [Stripe Radar · 地区政策短路拦截] 本地查表 BIN={bin_prefix} 属于 [{issuer.name}]，发卡地为 【{region_cn} ({card_region})】！\n"
+                f"     命中规则: 商户 [{merchant.name}] 禁止接收 {merchant.blocked_regions} 地区银行卡 (内部原因码: country_not_supported)"
+            )
+            return False, f"Your card has been declined. (政策限制: 不支持 {region_cn}[{card_region}] 发行的银行卡)"
+
+        # 2. 检查是否命中商户拉黑的高频虚拟卡 BIN 黑名单 (如 Roogoo 的 454924)
+        if merchant.blacklisted_bins and bin_prefix in merchant.blacklisted_bins:
+            print(
+                f"  🚫 [Stripe Radar · 虚拟卡 BIN 黑名单短路拦截] 本地查表识别出 BIN={bin_prefix} ({issuer.name} · {region_cn})\n"
+                f"     命中规则 1: BIN [{bin_prefix}] 已被标记为高频 Web3 虚拟卡号段 (high_risk_virtual_card_bin)\n"
+                f"     命中规则 2: 卡片资金属性为 '{funding_type}' (Prepaid 预付卡)，且发卡地为离岸金融区 '{card_region}' 而非美国本土 'US'\n"
+                f"     ⚡ 动作: Stripe Radar 直接在收单层掐断请求（不发往 VisaNet，也不通知 Roogoo），向网页前端返回笼统报错: 'Your card has been declined.'"
+            )
+            return False, "Your card has been declined."
+
+        # 3. 检查是否开启了一刀切拦截 Prepaid 预付卡
+        if merchant.block_prepaid and funding_type == "prepaid":
+            print(
+                f"  🚫 [Stripe Radar · 预付卡属性短路拦截] 识别到 BIN={bin_prefix} 的资金属性为 【Prepaid (预付卡)】！\n"
+                f"     命中规则: Block if ::card_funding:: == 'prepaid'"
+            )
+            return False, "Your card has been declined."
+
         print(
-            f"  <- [{self.name} 授权通过({auth_id})] 企业子卡扣款冻结 ${req.amount:.2f} "
-            f"(消费手续费 $0.00 | 剩: ${card.available_balance:.2f})"
+            f"  ✅ [Stripe Radar · 预检放行] BIN={bin_prefix} ({region_cn}·{funding_type}) 通过收单层风控，准备发往 VisaNet..."
         )
-        return AuthResponse(approved=True, code="00", message="Approved", auth_id=auth_id)
+        return True, "OK"
 
 
 class Acquirer:
-    """
-    收单机构（如 Stripe）
-    内置【Stripe Radar 风控规则引擎】，可在把报文发给 VisaNet 之前，根据：
-    1. 发卡国家/地区 (blocked_regions)
-    2. 卡片资金属性 (block_prepaid: 是否封杀 Prepaid 预付虚拟卡)
-    3. 高危网红虚拟卡段黑名单 (blacklisted_bins: 如被大量滥用的 454924 等)
-    直接拦截交易，并向前端统一展示模糊报错："Your card has been declined."
-    """
+    """收单机构（如 Stripe，内置 StripeRadar 风控引擎）"""
 
     def __init__(self, name: str, network: CardNetwork):
         self.name = name
         self.network = network
+        self.radar = StripeRadar()
         self.merchant_accounts: dict[str, MerchantStripeAccount] = {}
         self.pending_transactions: list[Transaction] = []
 
@@ -491,51 +493,14 @@ class Acquirer:
         amount: float,
         tx_minute: int = 0,
     ) -> AuthResponse:
-        bin_prefix = card_number[:6]
         issuer = self.network.get_issuer_by_bin(card_number)
-        if not issuer:
-            return AuthResponse(approved=False, code="14", message="Your card has been declined (invalid_number)")
 
-        card_region = issuer.region
-        region_cn = REGION_NAMES.get(card_region, card_region)
-        funding_type = issuer.default_funding
+        # 第一关：先过 Stripe Radar 本地风控（如果被拦截，直接短路返回，绝不触碰 VisaNet 和发卡行！）
+        passed, decline_msg = self.radar.inspect(merchant, card_number, issuer)
+        if not passed:
+            return AuthResponse(approved=False, code="RADAR_BLOCK", message=decline_msg)
 
-        # 规则 1：地区合规拦截 (如 CN/HK，或者严格区分美属波多黎各 PR 与美国本土 US)
-        if merchant.blocked_regions and card_region in merchant.blocked_regions:
-            print(
-                f"  🚫 [{self.name} Radar · 地区政策拦截] BIN={bin_prefix} 发卡行为 [{issuer.name}]，发卡地为 【{region_cn} ({card_region})】！\n"
-                f"     商户 [{merchant.name}] 拒收来自 {merchant.blocked_regions} 的银行卡 (Stripe 内部码: country_not_supported)"
-            )
-            return AuthResponse(
-                approved=False,
-                code="62",
-                message=f"Your card has been declined. (原因: 商户政策禁入 {region_cn}[{card_region}])",
-            )
-
-        # 规则 2：Anthropic 等严苛商户专门针对【高危虚拟卡 BIN 黑名单】或【Prepaid 预付卡属性】的拦截
-        if merchant.blacklisted_bins and bin_prefix in merchant.blacklisted_bins:
-            print(
-                f"  🚫 [{self.name} Radar · 虚拟卡段黑名单拦截] 命中高危虚拟卡 BIN [{bin_prefix}] ({issuer.name})！\n"
-                f"     内部原因：该波多黎各离岸卡段 ({bin_prefix}) 被大量用户集中用于注册 AI 账号，已被 [{merchant.name}] 列入 BIN 黑名单！\n"
-                f"     注意：请求在 Stripe 层直接被掐断，根本未发往 VisaNet 和 Roogoo，前端仅显示 'Your card has been declined.'"
-            )
-            return AuthResponse(
-                approved=False,
-                code="62",
-                message=f"Your card has been declined. (Stripe Radar 内部拦截: 虚拟卡 BIN [{bin_prefix}] 已被拉黑)",
-            )
-
-        if merchant.block_prepaid and funding_type == "prepaid":
-            print(
-                f"  🚫 [{self.name} Radar · 卡片属性拦截] 识别到 BIN={bin_prefix} 的资金属性为 【Prepaid (预付充值卡)】！\n"
-                f"     商户 [{merchant.name}] 启用了 'Block Prepaid Cards' 规则，仅允许 Credit(信用卡) 或 Debit(借记卡) 绑定订阅！"
-            )
-            return AuthResponse(
-                approved=False,
-                code="62",
-                message="Your card has been declined. (Stripe Radar 内部拦截: 拒绝 Prepaid 预付属性虚拟卡)",
-            )
-
+        # 第二关：通过 Stripe Radar 后，才打包 ISO 8583 报文发往 VisaNet 和上游发卡行
         req = AuthRequest(
             card_number=card_number,
             cvv=cvv,
@@ -562,13 +527,94 @@ class Acquirer:
                 )
             )
         else:
-            print(f"  <- [{self.name}] 收到拒绝回执：[{resp.code}] {resp.message}")
+            print(f"  <- [{self.name}] 收到发卡行拒绝回执：[{resp.code}] {resp.message}")
 
         return resp
 
 
+class AlipayGiftCardStore:
+    """
+    【支付宝 · 出境惠 / PockytShop 礼品卡小程序】
+    允许中国大陆用户直接用人民币（支付宝余额/国内储蓄卡）购买美区 Apple Gift Card 兑换码，无需任何海外银行卡！
+    """
+
+    USD_TO_CNY_RATE = 7.25
+
+    def buy_us_apple_gift_card(self, user_name: str, face_value_usd: float) -> AppleGiftCard:
+        cny_cost = round(face_value_usd * self.USD_TO_CNY_RATE, 2)
+        code = f"APPL-US-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
+        gift_card = AppleGiftCard(code=code, face_value=face_value_usd, region="US")
+        print(
+            f"\n[支付宝 · 苹果礼品卡小程序] 用户 [{user_name}] 使用支付宝人民币付款 ¥{cny_cost:.2f} "
+            f"(折合 ${face_value_usd:.2f})\n"
+            f"  └─ 🎁 成功出码！美区 Apple Gift Card 兑换码: 【{gift_card.code}】 (面值: ${gift_card.face_value:.2f})"
+        )
+        return gift_card
+
+
+class AppleAppStore:
+    """
+    【美区 Apple App Store & In-App Purchase (IAP) 内购结算中心】
+    核心破局原理：
+    用户用礼品卡充值美区 Apple ID 余额后，在 iOS 端 Claude App 内发起订阅。
+    扣款完全在苹果内部账本完成（根本不经过 Stripe Radar，也不经过 VisaNet，没有任何银行卡 BIN 校验！），
+    随后苹果服务器直接向 Anthropic 发送加密签名凭据 (JWS Receipt) 通知开通会员！
+    """
+
+    APPLE_TAX_RATE = 0.30  # 苹果内购抽成 30%
+
+    def __init__(self):
+        # 美区 Apple ID -> 账户美元余额 (Apple Account Balance)
+        self.apple_id_balances: dict[str, float] = {}
+        self.revenue: float = 0.0
+
+    def register_us_apple_id(self, apple_id: str) -> None:
+        self.apple_id_balances[apple_id] = 0.0
+        print(f"[Apple App Store (美区)] 用户已登录美区 Apple ID: [{apple_id}] (当前账户余额: $0.00)")
+
+    def redeem_gift_card(self, apple_id: str, gift_card: AppleGiftCard) -> None:
+        """将支付宝买到的美区 Apple Gift Card 充值进美区 Apple ID 余额"""
+        gift_card.redeemed = True
+        self.apple_id_balances[apple_id] = round(
+            self.apple_id_balances.get(apple_id, 0.0) + gift_card.face_value, 2
+        )
+        print(
+            f"[Apple App Store (美区)] 兑换码 [{gift_card.code}] 充值成功！\n"
+            f"  └─ 🍎 美区 Apple ID [{apple_id}] 当前可用余额: ${self.apple_id_balances[apple_id]:.2f}"
+        )
+
+    def subscribe_via_iap(self, apple_id: str, merchant: "Merchant", plan_name: str, price: float) -> bool:
+        """在 iOS 端 App 内通过 Apple ID 余额发起内购订阅 (In-App Purchase)"""
+        print(
+            f"\n[iOS 端 {merchant.name} App · Apple IAP 内购收银台] "
+            f"用户 [{apple_id}] 点击订阅【{plan_name}】(${price:.2f}/月)"
+        )
+        balance = self.apple_id_balances.get(apple_id, 0.0)
+        if balance < price:
+            print(f"  <- [Apple IAP] 订阅失败：Apple ID 余额不足 (${balance:.2f} < ${price:.2f})")
+            return False
+
+        # 1. 直接从 Apple ID 余额扣款（彻底绕开 Stripe 与银行卡网络！）
+        self.apple_id_balances[apple_id] = round(balance - price, 2)
+        apple_commission = round(price * self.APPLE_TAX_RATE, 2)
+        merchant_net = round(price - apple_commission, 2)
+        self.revenue = round(self.revenue + apple_commission, 2)
+        merchant.corporate_bank_balance = round(merchant.corporate_bank_balance + merchant_net, 2)
+
+        jws_receipt = f"APPLE-JWS-RECEIPT-{random.randint(10000, 99999)}"
+        print(
+            f"  -> [Apple IAP 内部账本扣款] 已从 [{apple_id}] 的 Apple ID 余额扣除 ${price:.2f} "
+            f"(剩余: ${self.apple_id_balances[apple_id]:.2f})\n"
+            f"     ⚡ 绕过验证：全程未经过 Stripe Radar，无需校验任何银行卡 BIN 或 Prepaid 属性！\n"
+            f"  -> [Apple 佣金结算] 苹果截留 30% 苹果税 (${apple_commission:.2f})，向 [{merchant.name}] 结算 ${merchant_net:.2f}\n"
+            f"  -> [App Store Server Notification] 向 [{merchant.name}] 服务器发送苹果官方签名凭据: {jws_receipt}"
+        )
+        merchant.activate_by_apple_iap(apple_id, plan_name, jws_receipt)
+        return True
+
+
 class Merchant:
-    """商户（可配置地区黑名单、是否拦截 Prepaid 预付卡、以及特定虚拟卡 BIN 黑名单）"""
+    """商户"""
 
     def __init__(
         self,
@@ -590,20 +636,29 @@ class Merchant:
         self.blacklisted_bins = blacklisted_bins
         self.require_3ds = require_3ds
         self.corporate_bank_balance: float = 0.0
+        self.active_subscribers: list[str] = []
         acquirer.register_merchant(self)
 
     def checkout(self, card_number: str, cvv: str, expiry: str, amount: float, tx_minute: int = 0) -> bool:
         print(
-            f"\n[{self.name} 收银台 ({self.country}·MCC:{self.mcc}) | 时间:T+{tx_minute}m] "
+            f"\n[{self.name} 网页端 Stripe 收银台 ({self.country}·MCC:{self.mcc}) | 时间:T+{tx_minute}m] "
             f"发起扣款: 卡号 {card_number[:6]}******{card_number[-4:]} | 金额 ${amount:.2f}"
         )
         resp = self.acquirer.process_payment(self, card_number, cvv, expiry, amount, tx_minute=tx_minute)
         if resp.approved:
-            print(f"[{self.name} 收银台] ✅ 支付成功！")
+            print(f"[{self.name} 网页端收银台] ✅ 支付成功！")
             return True
         else:
-            print(f"[{self.name} 收银台] ❌ 支付被拒：{resp.message}")
+            print(f"[{self.name} 网页端收银台] ❌ 网页弹窗提示：{resp.message}")
             return False
+
+    def activate_by_apple_iap(self, apple_id: str, plan_name: str, jws_receipt: str) -> None:
+        """商户后端收到苹果 App Store 的内购成功通知，直接为用户激活订阅"""
+        self.active_subscribers.append(apple_id)
+        print(
+            f"  <- [{self.name} 后端服务器] 校验苹果签名凭据 [{jws_receipt}] 通过！\n"
+            f"     🎉 已为账号 [{apple_id}] 成功激活【{plan_name}】权限（可在终端直接登录使用 Claude Code）！"
+        )
 
 
 class User:
@@ -615,6 +670,6 @@ class User:
 
     def pay(self, merchant: Merchant, card: VirtualCard, amount: float, tx_minute: int = 0) -> bool:
         print(
-            f"\n=== [{self.identifier}] 使用 【{card.tier.display_name}】 在 [{merchant.name}] 消费 ${amount:.2f} ==="
+            f"\n=== [{self.identifier}] 使用 【{card.tier.display_name}】 在 [{merchant.name}] 刷卡消费 ${amount:.2f} ==="
         )
         return merchant.checkout(card.card_number, card.cvv, card.expiry, amount, tx_minute=tx_minute)
