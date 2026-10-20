@@ -184,3 +184,30 @@ class MerchantStripeAccount:
     pending_balance: float = 0.0
     available_balance: float = 0.0
 
+
+@dataclass
+class PassportDocument:
+    """【用户提交给 Persona 弹窗的真实国际旅行证件与 3D 活体人脸特征】"""
+
+    holder_name: str          # 持照人姓名 ("Alice" / "灰产张老板")
+    nationality: str          # 护照签发国籍代码 ("CN" 中国护照 / "US" 美国护照 / "IR" 伊朗护照 / "KP" 朝鲜护照)
+    passport_no: str          # 护照号码 ("E88990011")
+    face_biometric_id: str    # 摄像头采集的 3D 活体面部生物特征源 ID ("FACE-3D-ALICE")
+    is_live_human: bool = True  # 是否通过摄像头转头眨眼 3D 活体检测 (拦截模拟器假视频/静态网图)
+
+
+@dataclass
+class PersonaVerificationResult:
+    """【美国第三方身份核验平台 Persona (withpersona.com) 审核回执】"""
+
+    inquiry_id: str           # Persona 核验工单号 ("inq_...")
+    account_email: str        # 关联的 Claude 账号邮箱
+    client_ip_region: str     # 客户端当前访问的网络物理位置 ("US" / "CN")
+    passport_nationality: str  # 证件国籍 ("CN")
+    passport_hash: str        # 护照号单向哈希 (用于防一人多号去重)
+    face_embedding_hash: str  # 3D 人脸特征向量哈希 (用于防换证件/防女巫攻击去重)
+    passed: bool              # 是否通过核验
+    decision_code: str        # 决策代码 ("APPROVED_HUMAN" | "SYBIL_DUPLICATE_BLOCK" | "OFAC_SANCTION_BLOCK" | "GEOFENCE_IP_BLOCK")
+    reason: str               # 详细合规与风控判定原因
+
+

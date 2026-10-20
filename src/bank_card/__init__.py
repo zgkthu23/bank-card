@@ -1,3 +1,4 @@
+from bank_card.models import PassportDocument
 from bank_card.roles import (
     Acquirer,
     AlipayCrossBorder,
@@ -7,6 +8,7 @@ from bank_card.roles import (
     IssuerBank,
     Merchant,
     OnshoreClearingBank,
+    PersonaIdentityGateway,
     PockytGateway,
     RoogooPlatform,
     SAFEForeignExchangeBureau,
@@ -169,7 +171,66 @@ def main() -> None:
     # 第 5 步：国内持卡人账单日“人民币自动购汇还款”闭环（解答为什么刷招行/中行信用卡不需要提前存美元）
     cmb_cn_bank.auto_repay_credit_bill_in_cny(cmb_visa, spot_fx_rate=7.2500)
 
+    print("\n================================================================================")
+    print("  阶段 7：揭秘 Anthropic × Persona 实名风控 —— 为什么封杀中国银行卡(CN BIN)，却放行【中国护照 + 真人扫脸】？")
+    print("================================================================================")
+    persona_gateway = PersonaIdentityGateway()
+
+    # 实验 1：真实开发者 Alice 挂美国网络 ("US")，在 Persona 弹窗中如实选“中国国籍(CN)”、拍中国护照并扫脸 ➔ 100% 秒过！
+    alice_cn_passport = PassportDocument(
+        holder_name="Alice",
+        nationality="CN",
+        passport_no="E88990011",
+        face_biometric_id="FACE-3D-VECTOR-ALICE-001",
+        is_live_human=True,
+    )
+    anthropic.challenge_with_persona(
+        persona_gateway=persona_gateway,
+        account_email="alice_dev@gmail.com",
+        client_ip_region="US",
+        passport=alice_cn_passport,
+    )
+
+    # 实验 2：灰产号商张老板的噩梦 —— 能用 BaaS 开 1000 张虚拟卡，却栽在 Persona 的“唯一人脸/护照去重”手里 (防女巫攻击)
+    studio_boss_passport = PassportDocument(
+        holder_name="灰产张老板",
+        nationality="CN",
+        passport_no="E77665544",
+        face_biometric_id="FACE-3D-VECTOR-BOSS-ZHANG",
+        is_live_human=True,
+    )
+    print("\n🕵️ [灰产工作室实测] 张老板用自己的中国护照和真脸，先为第 1 个倒卖小号过 Persona 认证：")
+    anthropic.challenge_with_persona(
+        persona_gateway=persona_gateway,
+        account_email="studio_bot_01@gmail.com",
+        client_ip_region="US",
+        passport=studio_boss_passport,
+    )
+    print("\n🕵️ [灰产工作室实测] 1 分钟后，张老板的第 2 个小号也弹出 Persona，他试图再次拿同一张脸/同一本护照去扫脸：")
+    anthropic.challenge_with_persona(
+        persona_gateway=persona_gateway,
+        account_email="studio_bot_02@gmail.com",
+        client_ip_region="US",
+        passport=studio_boss_passport,
+    )
+
+    # 实验 3：对比真正会被 Persona 按“国籍”一刀切拉黑的红线 —— OFAC 全面金融制裁国证件 (如伊朗 IR / 朝鲜 KP)
+    sanctioned_passport = PassportDocument(
+        holder_name="Mallory",
+        nationality="IR",
+        passport_no="P99001122",
+        face_biometric_id="FACE-3D-VECTOR-MALLORY",
+        is_live_human=True,
+    )
+    anthropic.challenge_with_persona(
+        persona_gateway=persona_gateway,
+        account_email="mallory_test@gmail.com",
+        client_ip_region="US",
+        passport=sanctioned_passport,
+    )
+
 
 if __name__ == "__main__":
     main()
+
 

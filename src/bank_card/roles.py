@@ -9,6 +9,8 @@ from bank_card.models import (
     CardTierConfig,
     InCommPOSARequest,
     MerchantStripeAccount,
+    PassportDocument,
+    PersonaVerificationResult,
     SAFEDeclaration,
     SwiftMT103Message,
     Transaction,
@@ -21,7 +23,10 @@ REGION_NAMES = {
     "HK": "中国香港",
     "PR": "美属波多黎各(离岸金融区)",
     "US": "美国本土",
+    "JP": "日本",
     "RU": "俄罗斯",
+    "IR": "伊朗(OFAC全面制裁国)",
+    "KP": "朝鲜(OFAC全面制裁国)",
 }
 
 
@@ -1250,6 +1255,156 @@ class AppleAppStore:
             )
 
 
+class PersonaIdentityGateway:
+    """
+    【美国第三方实名与生物特征核验平台 Persona (withpersona.com)】
+    解答核心迷惑：为什么 Anthropic 封禁中国地区(CN)和香港卡(HK BIN)，但在 Persona 弹窗里选“中国国籍 + 中国护照 + 扫脸”却能 100% 通过？
+    因为美国科技公司的合规与反黑产体系严格区分了三个正交维度：
+    1. 【地理管辖区围栏 (Geofencing / Location)】：限制物理上位于受限区域境内的网络访问 (client_ip_region)；
+    2. 【金融发卡归属地 (BIN Region)】：由 Stripe Radar 拦截未开放金融司法管辖区的银行卡；
+    3. 【自然人国籍 (Passport Nationality)】：
+       - 受美国《民权法案》(反国籍/族裔歧视法 National Origin Discrimination) 约束，严禁因为一个自然人持有中国护照就拒绝服务
+         （全球有数百万持中国护照的硅谷工程师、在美/在日留学生和合法出海开发者）；
+       - 只有美国财政部 OFAC 全面金融制裁名单上的极少数国家证件（朝鲜 KP、伊朗 IR、古巴 CU、叙利亚 SY）才会被按国籍一刀切拉黑；
+       - Persona 的真正杀手锏是【3D 活体检测 + 护照号哈希 & 面部生物特征向量唯一性去重 (Sybil Attack 防女巫攻击)】：
+         黑产工作室能用 BaaS 接口 1 分钟开 1000 张虚拟卡，但黑产老板只有 1 张脸、1 本真护照！
+    """
+
+    OFAC_COMPREHENSIVE_SANCTIONS = {"KP", "IR", "CU", "SY"}  # 朝鲜、伊朗、古巴、叙利亚
+
+    def __init__(self, name: str = "Persona 身份核验引擎 (withpersona.com)"):
+        self.name = name
+        # 护照号单向哈希 -> 已绑定的唯一账号邮箱 (防一本护照认证多个小号)
+        self.passport_hash_registry: dict[str, str] = {}
+        # 3D 人脸特征向量哈希 -> 已绑定的唯一账号邮箱 (防换证件或同一个人脸认证多个小号)
+        self.face_embedding_registry: dict[str, str] = {}
+
+    @staticmethod
+    def _hash_feature(raw_value: str) -> str:
+        return hashlib.sha256(raw_value.encode()).hexdigest()[:12]
+
+    def verify_inquiry(
+        self,
+        merchant: "Merchant",
+        account_email: str,
+        client_ip_region: str,
+        passport: PassportDocument,
+    ) -> PersonaVerificationResult:
+        inquiry_id = f"inq_{random.randint(100000, 999999)}"
+        passport_hash = self._hash_feature(f"{passport.nationality}:{passport.passport_no}")
+        face_hash = self._hash_feature(passport.face_biometric_id)
+        nat_cn = REGION_NAMES.get(passport.nationality, passport.nationality)
+        ip_cn = REGION_NAMES.get(client_ip_region, client_ip_region)
+
+        print(
+            f"\n  🪪 [{self.name} · 工单 {inquiry_id}] 收到账号 [{account_email}] 的身份核验请求\n"
+            f"     ├─ 访问网络位置 (IP Region): {ip_cn} ({client_ip_region}) | 申报证件国籍: {nat_cn} ({passport.nationality})\n"
+            f"     ├─ 证件哈希 (Passport Hash): {passport_hash} | 3D人脸特征哈希 (Face Embedding): {face_hash}"
+        )
+
+        # 第一关：检查当前访问 IP 是否违反地理围栏 (Geofencing)
+        if merchant.blocked_regions and client_ip_region in merchant.blocked_regions:
+            reason = f"物理网络位置 ({client_ip_region}) 位于受限司法管辖区 {merchant.blocked_regions} (Geofencing 拦截)"
+            print(f"     └─ 🚫 [核验拒绝 · GEOFENCE_IP_BLOCK] {reason}")
+            return PersonaVerificationResult(
+                inquiry_id=inquiry_id,
+                account_email=account_email,
+                client_ip_region=client_ip_region,
+                passport_nationality=passport.nationality,
+                passport_hash=passport_hash,
+                face_embedding_hash=face_hash,
+                passed=False,
+                decision_code="GEOFENCE_IP_BLOCK",
+                reason=reason,
+            )
+
+        # 第二关：检查是否属于美国财政部 OFAC 全面金融制裁国证件 (如朝鲜 KP、伊朗 IR)
+        if passport.nationality in self.OFAC_COMPREHENSIVE_SANCTIONS:
+            reason = (
+                f"证件签发国 [{nat_cn} ({passport.nationality})] 属于美国财政部 OFAC 全面制裁名单 "
+                f"{sorted(self.OFAC_COMPREHENSIVE_SANCTIONS)}，法律强制禁止提供服务"
+            )
+            print(f"     └─ 🚫 [核验拒绝 · OFAC_SANCTION_BLOCK] {reason}")
+            return PersonaVerificationResult(
+                inquiry_id=inquiry_id,
+                account_email=account_email,
+                client_ip_region=client_ip_region,
+                passport_nationality=passport.nationality,
+                passport_hash=passport_hash,
+                face_embedding_hash=face_hash,
+                passed=False,
+                decision_code="OFAC_SANCTION_BLOCK",
+                reason=reason,
+            )
+
+        # 第三关：检查摄像头 3D 活体检测 (防 Python 注册脚本 / AI 换脸假视频)
+        if not passport.is_live_human:
+            reason = "未通过摄像头 3D 活体转头检测 (疑似自动化脚本或静态合成图像)"
+            print(f"     └─ 🚫 [核验拒绝 · LIVENESS_FAILED] {reason}")
+            return PersonaVerificationResult(
+                inquiry_id=inquiry_id,
+                account_email=account_email,
+                client_ip_region=client_ip_region,
+                passport_nationality=passport.nationality,
+                passport_hash=passport_hash,
+                face_embedding_hash=face_hash,
+                passed=False,
+                decision_code="LIVENESS_FAILED",
+                reason=reason,
+            )
+
+        # 第四关（核心杀手锏）：生物特征与护照唯一性去重（防“一人开一万号”的女巫攻击 Sybil Attack）
+        existing_acct_by_face = self.face_embedding_registry.get(face_hash)
+        existing_acct_by_doc = self.passport_hash_registry.get(passport_hash)
+        bound_acct = existing_acct_by_face or existing_acct_by_doc
+
+        if bound_acct and bound_acct != account_email:
+            reason = (
+                f"命中反女巫攻击去重 (Sybil Defense)！该 3D 人脸特征({face_hash})/护照({passport_hash}) "
+                f"已被绑定至另一账号 [{bound_acct}]，严禁一人批量认证多个账号！"
+            )
+            print(
+                f"     └─ 🛑 [核验拒绝 · SYBIL_DUPLICATE_BLOCK] {reason}\n"
+                f"        💡 (黑产痛点：号商虽然能用 BaaS 接口 1 分钟开 1000 张虚拟卡，但老板只有 1 张真脸和 1 本真护照！)"
+            )
+            return PersonaVerificationResult(
+                inquiry_id=inquiry_id,
+                account_email=account_email,
+                client_ip_region=client_ip_region,
+                passport_nationality=passport.nationality,
+                passport_hash=passport_hash,
+                face_embedding_hash=face_hash,
+                passed=False,
+                decision_code="SYBIL_DUPLICATE_BLOCK",
+                reason=reason,
+            )
+
+        # 全部通过！记录唯一生物指纹与护照哈希
+        self.passport_hash_registry[passport_hash] = account_email
+        self.face_embedding_registry[face_hash] = account_email
+
+        compliance_note = (
+            f"虽证件国籍为【{nat_cn} ({passport.nationality})】，但：(1) 不在 OFAC 全面制裁名单内；"
+            f"(2) 美国《民权法案》禁止基于自然人国籍歧视合法在海外/合规网络下的持照人；"
+            f"(3) 已通过 3D 活体与全球唯一生物特征去重，确认为真实唯一人类开发者！"
+        )
+        print(
+            f"     ├─ ✅ [合规与反歧视法校验通过] {compliance_note}\n"
+            f"     └─ 🎉 [核验通过 · APPROVED_HUMAN] 已将唯一人脸哈希({face_hash})与护照哈希({passport_hash})永久锁定至账号 [{account_email}]"
+        )
+        return PersonaVerificationResult(
+            inquiry_id=inquiry_id,
+            account_email=account_email,
+            client_ip_region=client_ip_region,
+            passport_nationality=passport.nationality,
+            passport_hash=passport_hash,
+            face_embedding_hash=face_hash,
+            passed=True,
+            decision_code="APPROVED_HUMAN",
+            reason=compliance_note,
+        )
+
+
 class Merchant:
     """商户"""
 
@@ -1274,6 +1429,7 @@ class Merchant:
         self.require_3ds = require_3ds
         self.corporate_bank_balance: float = 0.0
         self.active_subscribers: list[str] = []
+        self.trusted_human_accounts: set[str] = set()
         acquirer.register_merchant(self)
 
     def checkout(self, card_number: str, cvv: str, expiry: str, amount: float, tx_minute: int = 0) -> bool:
@@ -1297,6 +1453,34 @@ class Merchant:
             f"     🎉 已为账号 [{apple_id}] 成功激活【{plan_name}】权限（可在终端直接登录使用 Claude Code）！"
         )
 
+    def challenge_with_persona(
+        self,
+        persona_gateway: PersonaIdentityGateway,
+        account_email: str,
+        client_ip_region: str,
+        passport: PassportDocument,
+    ) -> bool:
+        """
+        当网页端检测到中度可疑信号时，Anthropic 弹出 Persona 窗口要求用户拍照上传护照并扫脸：
+        验证通过后将账号标记为高信誉真人账号 (trusted_human_accounts)
+        """
+        print(
+            f"\n🛡️ [{self.name} 网页端风控挑战] 账号 [{account_email}] 触发真人身份核验弹窗 ➔ 调用 [{persona_gateway.name}]"
+        )
+        res = persona_gateway.verify_inquiry(
+            merchant=self,
+            account_email=account_email,
+            client_ip_region=client_ip_region,
+            passport=passport,
+        )
+        if res.passed:
+            self.trusted_human_accounts.add(account_email)
+            print(f"[{self.name} 风控中心] ✅ 账号 [{account_email}] 已加冕【高信誉唯一真人标签 (Trusted Human)】，解除封号风险！")
+            return True
+        else:
+            print(f"[{self.name} 风控中心] ❌ 账号 [{account_email}] 身份核验未通过 ({res.decision_code})，已限制订阅权限！")
+            return False
+
 
 class User:
     """持卡人"""
@@ -1310,3 +1494,4 @@ class User:
             f"\n=== [{self.identifier}] 使用 【{card.tier.display_name}】 在 [{merchant.name}] 刷卡消费 ${amount:.2f} ==="
         )
         return merchant.checkout(card.card_number, card.cvv, card.expiry, amount, tx_minute=tx_minute)
+
