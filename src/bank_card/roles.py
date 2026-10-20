@@ -6,7 +6,10 @@ from bank_card.models import (
     AuthResponse,
     CardBehavioralProfile,
     CardTierConfig,
+    InCommPOSARequest,
     MerchantStripeAccount,
+    SAFEDeclaration,
+    SwiftMT103Message,
     Transaction,
     VirtualCard,
 )
@@ -532,60 +535,267 @@ class Acquirer:
         return resp
 
 
-class PockytAlipayChain:
+class SAFEForeignExchangeBureau:
     """
-    【支付宝“惠出境” + Pockyt (原 Yuansfer 源汇) 跨境收单网关 + PockytShop 商城 + InComm 一级总代】
-    完整还原你在支付宝定位切到美国旧金山、进入 PockytShop 买 $20 美区苹果卡的真实链路：
-    1. Pockyt (Yuansfer Inc.) 是总部位于美国纽约的跨境聚合支付网关（专门帮海外商户收中国人的支付宝/微信人民币）。
-    2. Pockyt 自己开了一家数字礼品卡商城 PockytShop (shop.pockyt.io)，嵌入在支付宝“惠出境”小程序里。
-    3. 当你付 ¥145.00 CNY 时：
-       - [境内端] 支付宝扣除你的人民币，凭《跨境外汇支付牌照》把你的身份证号+订单号报送国家外汇管理局(SAFE)做真实跨境消费申报；
-       - [购汇出境] 境内清算银行(如中行)在银行间外汇市场将 ¥145.00 CNY 购汇成 $20.00 USD (扣 $0.30 跨境清算费)，
-         通过 SWIFT 电汇至 Pockyt (Yuansfer Inc.) 在美国摩根大通银行的美元清算账户；
-       - [批发激活] Pockyt 截留 $0.30 分销毛利，调用苹果美国一级总代 (InComm / Blackhawk) 接口，
-         向【美国苹果总公司 (Apple Inc. US)】支付 $19.40 USD 批发款，实时激活一张 $20.00 面值的美区兑换码发给你！
+    【国家外汇管理局 (SAFE) · 跨境外汇支付业务监测系统】
+    依据《国家外汇管理局关于规范跨境电子商务外汇支付业务的通知》(汇发〔2019〕13号)：
+    1. 严禁支付机构只申报一个笼统的“境外汇款总包”，必须执行【逐笔还原申报 (Transaction Restoration)】；
+    2. 核验“三单合一”：境内买家实名身份证 (`buyer_id_card`) + 境外商户真实子订单号 (`sub_order_id`) + 资金流水；
+    3. 核验国际收支交易编码 (`bop_code = "122030"` 代表经常项目-网络购物/数字商品贸易) 与单笔限额；
+    4. 核验通过后签发电子核准令牌 (`SAFE-PERMIT-...`)，境内清算银行必须凭此令牌才允许将人民币购汇为美元汇出境外。
     """
 
-    USD_TO_CNY_RATE = 7.25
-    ALIPAY_CROSS_BORDER_FEE = 0.30  # 支付宝与境内清算行跨境购汇通道费 ($0.30)
-    POCKYT_INCOMM_MARGIN = 0.30     # PockytShop 与上游总代 InComm 的分销毛利 ($0.30)
+    SINGLE_TX_LIMIT_USD = 50000.0  # 跨境电商外汇支付单笔上限 ($50,000)
 
-    def __init__(self, apple_us: "AppleAppStore"):
-        self.apple_us = apple_us
-        self.alipay_fx_revenue: float = 0.0
-        self.pockyt_revenue: float = 0.0
+    def __init__(self):
+        self.declarations_ledger: list[SAFEDeclaration] = []
+        self.citizen_fx_ledgers: dict[str, float] = {}  # 身份证号 -> 累计跨境消费购汇额 (USD)
 
-    def buy_from_pockytshop(self, user_name: str, id_card_no: str, face_value_usd: float) -> AppleGiftCard:
-        cny_paid = round(face_value_usd * self.USD_TO_CNY_RATE, 2)
-        code = f"X9POCKYT{random.randint(10000000, 99999999)}"
+    def submit_restoration_declaration(self, decl: SAFEDeclaration) -> str:
+        """审核支付机构报送的《逐笔还原申报单》，通过后签发电子准购令牌"""
+        if decl.fx_usd_amount > self.SINGLE_TX_LIMIT_USD:
+            raise ValueError(f"超出外管局单笔跨境消费限额 ${self.SINGLE_TX_LIMIT_USD}")
 
-        # 1. 支付宝向国家外汇管理局(SAFE)申报个人跨境电商购汇，境内银行将 CNY 换成 USD 汇给美国 Pockyt (Yuansfer)
-        self.alipay_fx_revenue = round(self.alipay_fx_revenue + self.ALIPAY_CROSS_BORDER_FEE, 2)
-        usd_settled_to_pockyt = round(face_value_usd - self.ALIPAY_CROSS_BORDER_FEE, 2)
-
-        # 2. Pockyt (Yuansfer) 截留分销差价，通过一级总代 InComm 向美国苹果总公司支付美元批发款
-        self.pockyt_revenue = round(self.pockyt_revenue + self.POCKYT_INCOMM_MARGIN, 2)
-        wholesale_usd_to_apple = round(usd_settled_to_pockyt - self.POCKYT_INCOMM_MARGIN, 2)
-
-        # 3. 美国苹果总公司收到真实美元现金，并在资产负债表上记下 $20.00 的“预收礼品卡负债(Deferred Revenue)”
-        gift_card = self.apple_us.issue_wholesale_gift_card(
-            code=code,
-            face_value_usd=face_value_usd,
-            cash_received_usd=wholesale_usd_to_apple,
+        decl.approved_token = f"SAFE-PERMIT-{random.randint(100000, 999999)}"
+        self.declarations_ledger.append(decl)
+        self.citizen_fx_ledgers[decl.buyer_id_card] = round(
+            self.citizen_fx_ledgers.get(decl.buyer_id_card, 0.0) + decl.fx_usd_amount, 2
         )
 
         print(
-            f"\n[链路第 1~3 步：支付宝 ➔ Pockyt (Yuansfer) 跨境购汇 ➔ 美国苹果总公司]\n"
-            f"  ① [支付宝切旧金山 · PockytShop 下单] [{user_name}] 选购 ${face_value_usd:.2f} 美区 Apple 礼品卡，"
-            f"用支付宝人民币支付 ¥{cny_paid:.2f} CNY\n"
-            f"  ② [SAFE 外管局申报 + 银行代客购汇] 支付宝凭跨境外汇牌照向国家外管局(SAFE)还原申报实名订单 (身份证:{id_card_no})，\n"
-            f"     境内合作银行将 ¥{cny_paid:.2f} CNY 购汇为 ${face_value_usd:.2f} USD (扣除跨境清算费 ${self.ALIPAY_CROSS_BORDER_FEE:.2f})，\n"
-            f"     通过 SWIFT 电汇 ${usd_settled_to_pockyt:.2f} USD 至【美国 Pockyt (Yuansfer Inc.) 纽约美元收单账户】\n"
-            f"  ③ [Pockyt + 一级总代 InComm 批发激活] Pockyt 留存分销毛利 ${self.POCKYT_INCOMM_MARGIN:.2f}，"
-            f"通过一级总代 InComm 向【美国苹果总公司 (Apple Inc.)】支付批发款 ${wholesale_usd_to_apple:.2f} USD，\n"
-            f"     实时提取 16 位美区兑换码发至你的页面/邮箱: 【{gift_card.code}】"
+            f"  🏛️ [国家外管局 SAFE · 还原申报核验] 收到 [{decl.payment_institution}] 报送单 [{decl.declaration_no}]\n"
+            f"     ├─ 实名主体穿透: 买家={decl.buyer_name} (身份证:{decl.buyer_id_card}) <-> 还原境外子订单={decl.sub_order_id}\n"
+            f"     ├─ 国际收支编码: BOP={decl.bop_code} (跨境电商经常项目消费) | 申报购汇: ¥{decl.cny_amount:.2f} CNY ➔ ${decl.fx_usd_amount:.2f} USD\n"
+            f"     └─ ✅ 三单合一核验通过！签发外管局准购电子令牌: 【{decl.approved_token}】"
+        )
+        return decl.approved_token
+
+
+class OnshoreClearingBank:
+    """
+    【境内合作外汇清算银行 (如：中国银行境内分行 BKCHCNBJ)】
+    为什么支付宝不能自己把人民币变成美元？
+    因为支付宝是“非银行支付机构”，没有银行间外汇市场做市商席位，也没有海外美元清算头寸。
+    必须由境内清算银行：
+    1. 校验外管局签发的 `safe_approval_token`（无外管局令牌严禁售汇）；
+    2. 收取支付宝备付金专户划来的人民币 (`¥145.00 CNY`)，按银行即期外汇牌价 (`7.2500`) 执行【代客即期售汇】转换成 `$20.00 USD`；
+    3. 扣除跨境清算与 SWIFT 电报费 (`$0.30 USD`)，从本行驻纽约代理行的美元往账池 (`usd_nostro_pool`) 划出 `$19.70 USD`，
+       发送真实的 `SWIFT MT103` 跨境电文至纽约摩根大通银行 (`CHASUS33`)。
+    """
+
+    SPOT_ASK_RATE = 7.2500          # 银行美元现汇卖出价 (1 USD = 7.2500 CNY)
+    CORRESPONDENT_FEE_USD = 0.30    # 跨境清算及 SWIFT 电报手续费 ($0.30)
+
+    def __init__(self, name: str = "中国银行境内跨境清算中心", bic: str = "BKCHCNBJ"):
+        self.name = name
+        self.bic = bic
+        self.cny_fx_pool: float = 0.0             # 银行吸收的购汇人民币资金池 (+¥145.00)
+        self.usd_nostro_pool: float = 1_000_000.0 # 银行存放于纽约代理行的美元往账头寸池 (Nostro Account)
+        self.fx_fee_revenue_usd: float = 0.0      # 银行与跨境通道留存的清算手续费 (+$0.30)
+        self.swift_mt103_log: list[SwiftMT103Message] = []
+
+    def execute_spot_fx_and_swift_wire(
+        self,
+        cny_received: float,
+        target_usd: float,
+        safe_approval_token: str,
+        receiver_bic: str,
+        beneficiary_name: str,
+    ) -> SwiftMT103Message:
+        """凭外管局准购令牌执行代客即期购汇，并向境外收款行发送 SWIFT MT103 报文"""
+        if not safe_approval_token.startswith("SAFE-PERMIT-"):
+            raise PermissionError("缺少国家外管局 (SAFE) 准购令牌，境内银行拒绝办理跨境购汇及汇出！")
+
+        # 1. 吸收人民币备付金，按即期牌价售出美元
+        self.cny_fx_pool = round(self.cny_fx_pool + cny_received, 2)
+        gross_usd = round(cny_received / self.SPOT_ASK_RATE, 2)
+        assert abs(gross_usd - target_usd) < 0.01
+
+        # 2. 扣除跨境清算费 $0.30，从纽约美元往账头寸池划出净额 $19.70
+        self.fx_fee_revenue_usd = round(self.fx_fee_revenue_usd + self.CORRESPONDENT_FEE_USD, 2)
+        net_settled_usd = round(gross_usd - self.CORRESPONDENT_FEE_USD, 2)
+        self.usd_nostro_pool = round(self.usd_nostro_pool - net_settled_usd, 2)
+
+        mt103 = SwiftMT103Message(
+            uetr=f"UETR-{random.randint(1000, 9999)}-4b9a-8c11",
+            sender_bic=self.bic,
+            receiver_bic=receiver_bic,
+            beneficiary_name=beneficiary_name,
+            safe_approval_token=safe_approval_token,
+            cny_debited=cny_received,
+            fx_rate=self.SPOT_ASK_RATE,
+            gross_usd_purchased=gross_usd,
+            correspondent_fee_usd=self.CORRESPONDENT_FEE_USD,
+            net_settled_usd=net_settled_usd,
+        )
+        self.swift_mt103_log.append(mt103)
+
+        print(
+            f"  🏦 [{self.name} ({self.bic}) · 代客购汇与 SWIFT 清算] 核验外管局令牌 [{safe_approval_token}] 有效！\n"
+            f"     ├─ 银行间外汇市场平盘: 收入备付金 +¥{cny_received:.2f} CNY (@汇率 {self.SPOT_ASK_RATE:.4f}) ➔ 售出本金 ${gross_usd:.2f} USD\n"
+            f"     ├─ 扣除跨境清算/电报费: -${self.CORRESPONDENT_FEE_USD:.2f} USD | 扣减本行驻纽约美元头寸池(Nostro): -${net_settled_usd:.2f} USD\n"
+            f"     └─ 📡 发送 [SWIFT MT103 报文 {mt103.uetr}]: {self.bic} ➔ {receiver_bic} ({beneficiary_name}) 实汇: ${net_settled_usd:.2f} USD"
+        )
+        return mt103
+
+
+class AlipayCrossBorder:
+    """
+    【支付宝(中国)网络技术有限公司 —— 境内收银台 + 持牌跨境外汇支付机构】
+    职责：
+    1. 从中国用户的支付宝余额/境内银行卡扣取人民币 (`¥145.00 CNY`)，存入境内《人民币跨境备付金专户》；
+    2. 调取用户的实名认证信息（姓名+身份证号），结合境外收单网关（Pockyt）传回的真实子订单号，
+       向国家外汇管理局 (`SAFEForeignExchangeBureau`) 发起【逐笔还原申报】；
+    3. 拿到外管局电子准购令牌后，将备付金专户里的 `¥145.00 CNY` 划转给境内清算银行 (`OnshoreClearingBank`) 完成购汇与跨境电汇。
+    """
+
+    def __init__(self, safe_bureau: SAFEForeignExchangeBureau, clearing_bank: OnshoreClearingBank):
+        self.institution_name = "支付宝(中国)网络技术有限公司"
+        self.safe_bureau = safe_bureau
+        self.clearing_bank = clearing_bank
+        self.cny_custody_pool: float = 0.0  # 境内人民币跨境备付金专户余额
+
+    def settle_cross_border_order(
+        self,
+        buyer_name: str,
+        buyer_id_card: str,
+        sub_order_id: str,
+        overseas_merchant: str,
+        receiver_bic: str,
+        order_usd: float,
+    ) -> SwiftMT103Message:
+        # 1. 按合作清算行实时牌价折算人民币并扣款入备付金池
+        cny_paid = round(order_usd * self.clearing_bank.SPOT_ASK_RATE, 2)
+        self.cny_custody_pool = round(self.cny_custody_pool + cny_paid, 2)
+        print(
+            f"\n[链路第 1 步：支付宝“惠出境”人民币收银]\n"
+            f"  ① [{self.institution_name}] 用户 [{buyer_name}] 选购美区 ${order_usd:.2f} 礼品卡 (子订单:{sub_order_id})，\n"
+            f"     支付宝按牌价 {self.clearing_bank.SPOT_ASK_RATE:.4f} 扣取人民币 ¥{cny_paid:.2f} CNY 存入《境内跨境人民币备付金专户》"
+        )
+
+        # 2. 向国家外汇管理局(SAFE)提交《逐笔还原申报单》
+        print(f"\n[链路第 2 步：SAFE 外管局逐笔还原申报 + 境内清算行代客购汇 + SWIFT MT103 跨境电汇]")
+        decl = SAFEDeclaration(
+            declaration_no=f"SAFE-DECL-{random.randint(10000, 99999)}",
+            payment_institution=self.institution_name,
+            buyer_name=buyer_name,
+            buyer_id_card=buyer_id_card,
+            sub_order_id=sub_order_id,
+            overseas_merchant=overseas_merchant,
+            bop_code="122030",
+            cny_amount=cny_paid,
+            fx_usd_amount=order_usd,
+        )
+        safe_token = self.safe_bureau.submit_restoration_declaration(decl)
+
+        # 3. 将备付金 ¥145.00 CNY 划给境内清算银行，凭外管局令牌购汇并发送 SWIFT MT103 电汇给美国 Pockyt
+        self.cny_custody_pool = round(self.cny_custody_pool - cny_paid, 2)
+        return self.clearing_bank.execute_spot_fx_and_swift_wire(
+            cny_received=cny_paid,
+            target_usd=order_usd,
+            safe_approval_token=safe_token,
+            receiver_bic=receiver_bic,
+            beneficiary_name=overseas_merchant,
+        )
+
+
+class InCommDistributor:
+    """
+    【美国一级礼品卡总代 InComm Payments (亚特兰大) —— POSA 实时点卡激活网关】
+    为什么 Pockyt 不能直接找苹果公司买一张 $20 的卡？
+    因为苹果总公司 (Apple Inc.) 不对中小电商直接零售卡密，而是授权全球两大一级总代（InComm 与 Blackhawk Network）
+    直连苹果内网的【POSA (Point-of-Sale Activation) 激活主机】：
+    - 苹果给一级总代 InComm 的批发价：面值的 97.0% ($19.40 USD，即 3% 批发折让)；
+    - 一级总代 InComm 给二级分销商 Pockyt 的拿货价：面值的 98.0% ($19.60 USD)；
+    - InComm 净赚 $0.20 USD (1.0%) B2B 通道差价，将 $19.40 USD 批发款打给美国苹果总公司，实时激活 16 位兑换码！
+    """
+
+    APPLE_WHOLESALE_RATIO = 0.97   # 一级总代向 Apple 拿货价: 97% ($19.40)
+    RETAILER_B2B_RATIO = 0.98      # 二级分销商(Pockyt)向 InComm 拿货价: 98% ($19.60)
+
+    def __init__(self, apple_us: "AppleAppStore"):
+        self.name = "InComm Payments (美国一级点卡总代)"
+        self.apple_us = apple_us
+        self.incomm_usd_bank_balance: float = 0.0  # InComm 美国银行账户净留存毛利 (+$0.20)
+        self.posa_log: list[InCommPOSARequest] = []
+
+    def activate_via_posa(self, req: InCommPOSARequest) -> AppleGiftCard:
+        """收到下游分销商 Pockyt 的 B2B 结算款 ($19.60)，扣除 $0.20 总代毛利后向美国苹果支付 $19.40 激活兑换码"""
+        apple_wholesale_usd = round(req.face_value_usd * self.APPLE_WHOLESALE_RATIO, 2)
+        incomm_margin_usd = round(req.b2b_payment_usd - apple_wholesale_usd, 2)
+
+        self.incomm_usd_bank_balance = round(self.incomm_usd_bank_balance + incomm_margin_usd, 2)
+        self.posa_log.append(req)
+
+        pin_code = f"X9POCKYT{random.randint(10000000, 99999999)}"
+        gift_card = self.apple_us.issue_wholesale_gift_card(
+            code=pin_code,
+            face_value_usd=req.face_value_usd,
+            cash_received_usd=apple_wholesale_usd,
+        )
+
+        print(
+            f"  🔌 [{self.name} · POSA 专线激活] 收到 [{req.retailer_id}] 报文 [{req.request_id}] 与 B2B 货款 ${req.b2b_payment_usd:.2f} USD\n"
+            f"     ├─ 一级总代分润清算: InComm 截留总代批零差价 +${incomm_margin_usd:.2f} USD (1.0%)\n"
+            f"     ├─ 向苹果总公司付款: 通过美国 ACH 向【Apple Inc. (Cupertino)】支付 97折批发款 ${apple_wholesale_usd:.2f} USD\n"
+            f"     └─ ⚡ Apple GSX/POSA 主机实时激活 $20.00 美区礼品卡密: 【{gift_card.code}】"
         )
         return gift_card
+
+
+class PockytGateway:
+    """
+    【美国 Pockyt (原 Yuansfer Inc. 源汇，总部纽约) —— 跨境收单网关 & PockytShop 自营商城】
+    完整串联境内支付宝与美国本土点卡供应链：
+    1. Pockyt 在美国纽约摩根大通银行 (`CHASUS33`) 开有美元收单清算账户 (`jpmorgan_ny_usd_balance`)；
+    2. 当中国用户在支付宝“惠出境 -> PockytShop”下单时，Pockyt 调用支付宝跨境接口触发【SAFE 还原申报 + 境内银行购汇电汇】；
+    3. 纽约摩根大通账户收到 SWIFT MT103 汇来的 `$19.70 USD` 净额；
+    4. Pockyt 自己截留 `$0.10 USD` 商城毛利，向美国一级总代 `InCommDistributor` 支付 `$19.60 USD` 采购款，
+       由 InComm 向美国苹果总公司支付 `$19.40 USD` 激活面值 `$20.00` 的美区兑换码！
+    """
+
+    RECEIVER_BIC = "CHASUS33 (纽约摩根大通银行 JPMorgan Chase NY)"
+    LEGAL_ENTITY = "Yuansfer Inc. DBA Pockyt (New York)"
+
+    def __init__(self, alipay_cb: AlipayCrossBorder, incomm: InCommDistributor):
+        self.alipay_cb = alipay_cb
+        self.incomm = incomm
+        self.jpmorgan_ny_usd_balance: float = 0.0  # Pockyt 纽约摩根大通银行美元账户净留存余额 (+$0.10)
+
+    def buy_from_pockytshop(self, user_name: str, id_card_no: str, face_value_usd: float) -> AppleGiftCard:
+        sub_order_id = f"POCKYT-ORD-{random.randint(10000, 99999)}"
+
+        # 第 1~2 步：调用支付宝跨境接口（扣取 ¥145 CNY -> SAFE 逐笔还原申报 -> 中国银行代客购汇 -> SWIFT MT103 电汇至纽约）
+        mt103 = self.alipay_cb.settle_cross_border_order(
+            buyer_name=user_name,
+            buyer_id_card=id_card_no,
+            sub_order_id=sub_order_id,
+            overseas_merchant=self.LEGAL_ENTITY,
+            receiver_bic=self.RECEIVER_BIC,
+            order_usd=face_value_usd,
+        )
+
+        # 第 3 步：Pockyt 纽约摩根大通账户入账 $19.70 USD，留存 $0.10 毛利，向一级总代 InComm 支付 $19.60 激活礼品卡
+        self.jpmorgan_ny_usd_balance = round(self.jpmorgan_ny_usd_balance + mt103.net_settled_usd, 2)
+        b2b_cost_to_incomm = round(face_value_usd * InCommDistributor.RETAILER_B2B_RATIO, 2)  # $19.60
+        pockyt_margin = round(mt103.net_settled_usd - b2b_cost_to_incomm, 2)                  # $0.10
+        self.jpmorgan_ny_usd_balance = round(self.jpmorgan_ny_usd_balance - b2b_cost_to_incomm, 2)
+
+        print(
+            f"\n[链路第 3 步：美国 Pockyt (Yuansfer) 纽约入账 ➔ 一级总代 InComm POSA 批发激活]\n"
+            f"  🗽 [{self.LEGAL_ENTITY}] 纽约摩根大通账户收到 SWIFT MT103 ({mt103.uetr}) 到账: +${mt103.net_settled_usd:.2f} USD\n"
+            f"     ├─ PockytShop 截留自营分销毛利: +${pockyt_margin:.2f} USD (留在纽约摩根大通账户)\n"
+            f"     └─ 向美国一级总代 InComm 划付 98折 B2B 采购款: -${b2b_cost_to_incomm:.2f} USD"
+        )
+
+        posa_req = InCommPOSARequest(
+            request_id=f"POSA-REQ-{random.randint(10000, 99999)}",
+            retailer_id="POCKYT-SHOP-US",
+            sku_code=f"APPLE-US-GC-{int(face_value_usd)}",
+            face_value_usd=face_value_usd,
+            b2b_payment_usd=b2b_cost_to_incomm,
+        )
+        return self.incomm.activate_via_posa(posa_req)
 
 
 class AppleAppStore:
@@ -691,7 +901,13 @@ class AppleAppStore:
         merchant.activate_by_apple_iap(apple_id, plan_name, jws_receipt)
         return True
 
-    def run_monthly_developer_payout(self, merchant: "Merchant") -> None:
+    def run_monthly_developer_payout(
+        self,
+        merchant: "Merchant",
+        clearing_bank: OnshoreClearingBank | None = None,
+        pockyt: PockytGateway | None = None,
+        incomm: InCommDistributor | None = None,
+    ) -> None:
         """【苹果财月月结 T+30~45天】美国苹果总公司通过美国本土 ACH 银行清算网，将 $14.00 USD 真正打入 Anthropic 美国银行卡"""
         payable = self.developer_payables.get(merchant.name, 0.0)
         if payable <= 0:
@@ -704,11 +920,19 @@ class AppleAppStore:
         print(
             f"\n[链路第 6 步：苹果财月月度结算 (T+30天) —— 美元最终流向 Anthropic]\n"
             f"  ⑥ [美国本土 ACH 跨行电汇] 美国苹果总公司 (Apple Inc. US) 从其美国银行账户划出 ${payable:.2f} USD，\n"
-            f"     直接打入 [{merchant.name}] 的美国企业对公银行账户！\n"
-            f"     📊 最终资金闭环盘点：你付的 ¥145.00 CNY ($20.00) ➔\n"
-            f"        支付宝跨境通道拿走 $0.40 | 美国分销商 Pockyt 拿走 $0.20 | 苹果净留存 $5.40 (名义苹果税$6.00 - 批发折让$0.60) | "
-            f"{merchant.name} 银行卡实收: ${merchant.corporate_bank_balance:.2f} USD！"
+            f"     直接打入 [{merchant.name}] 的美国企业对公银行账户！"
         )
+        if clearing_bank and pockyt and incomm:
+            print(
+                f"     📊 【全链路 6 大机构真实账本最终盘点 (¥145.00 CNY ➔ $20.00 USD 分账闭环)】\n"
+                f"        ├─ 1. 境内清算银行 ({clearing_bank.bic}): 吸收人民币 +¥{clearing_bank.cny_fx_pool:.2f} CNY | "
+                f"跨境电汇手续费收入: +${clearing_bank.fx_fee_revenue_usd:.2f} USD\n"
+                f"        ├─ 2. 纽约 Pockyt 网关 (Yuansfer Inc.): 摩根大通美元账户净留存毛利: +${pockyt.jpmorgan_ny_usd_balance:.2f} USD\n"
+                f"        ├─ 3. 美国一级总代 (InComm Payments): POSA 分销差价净留存毛利: +${incomm.incomm_usd_bank_balance:.2f} USD\n"
+                f"        ├─ 4. 美国苹果总公司 (Apple Inc. US): 银行账户净留存现金: +${self.apple_us_bank_cash:.2f} USD (名义30%苹果税$6.00 - 3%批发折让$0.60)\n"
+                f"        └─ 5. 开发者 ({merchant.name}): 美国对公银行账户实收: +${merchant.corporate_bank_balance:.2f} USD "
+                f"(合计: ${clearing_bank.fx_fee_revenue_usd + pockyt.jpmorgan_ny_usd_balance + incomm.incomm_usd_bank_balance + self.apple_us_bank_cash + merchant.corporate_bank_balance:.2f} USD)"
+            )
 
 
 class Merchant:

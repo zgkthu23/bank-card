@@ -1,11 +1,15 @@
 from bank_card.roles import (
     Acquirer,
+    AlipayCrossBorder,
     AppleAppStore,
     CardNetwork,
+    InCommDistributor,
     IssuerBank,
     Merchant,
-    PockytAlipayChain,
+    OnshoreClearingBank,
+    PockytGateway,
     RoogooPlatform,
+    SAFEForeignExchangeBureau,
     User,
     verify_luhn,
 )
@@ -89,16 +93,22 @@ def main() -> None:
     roogoo.print_app_bill(roogoo_card)
 
     print("\n================================================================================")
-    print("  阶段 4：深度拆解 Pockyt (Yuansfer) 6 步跨境链路 —— 人民币 ¥145 如何变成美元进入 Anthropic？")
+    print("  阶段 4：深度拆解 Pockyt (Yuansfer) 6 步跨境链路 —— 6 大独立机构如何把 ¥145 变成美元进入 Anthropic？")
     print("================================================================================")
+    # 组装境内监管与跨境购汇机构 + 美国本土点卡总代与苹果总公司
+    safe_bureau = SAFEForeignExchangeBureau()
+    boc_clearing_bank = OnshoreClearingBank(name="中国银行境内跨境清算中心", bic="BKCHCNBJ")
+    alipay_cross_border = AlipayCrossBorder(safe_bureau=safe_bureau, clearing_bank=boc_clearing_bank)
+
     us_app_store = AppleAppStore()
-    pockyt_chain = PockytAlipayChain(us_app_store)
+    incomm_us = InCommDistributor(apple_us=us_app_store)
+    pockyt_ny = PockytGateway(alipay_cb=alipay_cross_border, incomm=incomm_us)
 
     us_apple_id = "alice_us@icloud.com"
     us_app_store.register_us_apple_id(us_apple_id)
 
-    # 第 1~3 步：支付宝切旧金山进 PockytShop 付款 -> SAFE 申报与银行购汇 -> SWIFT 汇给美国 Pockyt (Yuansfer) -> 向美国苹果批发买码
-    gift_card = pockyt_chain.buy_from_pockytshop(
+    # 第 1~3 步：支付宝收 ¥145 -> SAFE 逐笔还原申报 -> 中国银行代客即期购汇 + SWIFT MT103 电汇纽约 -> Pockyt 调 InComm POSA 激活
+    gift_card = pockyt_ny.buy_from_pockytshop(
         user_name="Alice", id_card_no="1101011999********", face_value_usd=20.0
     )
 
@@ -116,8 +126,13 @@ def main() -> None:
         price=20.0,
     )
 
-    # 第 6 步：苹果财月月结（T+30天），美国苹果总公司通过美国 ACH 清算网将 $14.00 USD 真正打给 Anthropic
-    us_app_store.run_monthly_developer_payout(anthropic)
+    # 第 6 步：苹果财月月结（T+30天），美国苹果总公司通过美国 ACH 清算网将 $14.00 USD 真正打给 Anthropic，并盘点 6 大机构账本
+    us_app_store.run_monthly_developer_payout(
+        merchant=anthropic,
+        clearing_bank=boc_clearing_bank,
+        pockyt=pockyt_ny,
+        incomm=incomm_us,
+    )
 
     print("\n================================================================================")
     print("  阶段 5：VisaNet VAA 卡片历史行为画像库与黑客跨国盗刷熔断拦截")
