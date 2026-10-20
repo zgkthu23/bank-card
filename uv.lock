@@ -15,7 +15,7 @@ dev = [
 [package.metadata]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pudb", specifier = ">=2026.1" }]
+dev = [{ name = "pudb", git = "https://github.com/zgkthu23/pudb?branch=zgk-maintenance" }]
 
 [[package]]
 name = "jedi"
@@ -49,8 +49,8 @@ wheels = [
 
 [[package]]
 name = "pudb"
-version = "2026.1"
-source = { registry = "https://pypi.org/simple" }
+version = "2026.1+zgk.1"
+source = { git = "https://github.com/zgkthu23/pudb?branch=zgk-maintenance#a11b522e049efed3c718a50b8481dd11ff0f7020" }
 dependencies = [
     { name = "jedi" },
     { name = "packaging" },
@@ -58,10 +58,6 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "urwid" },
     { name = "urwid-readline" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/ed/9fed39a03222995a65ce2e1ebc90b9dc27dc099bcd05613a61a0967e0877/pudb-2026.1.tar.gz", hash = "sha256:e32c8eeca47087699548197f101b1fe195ab8187b90e171f0a38cc0852fca73c", size = 226013, upload-time = "2026-10-13T17:23:11.901Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/66/0c/27eb373a50f9b7d2342628af4dfb760315048352a116dda23c605d7e7677/pudb-2026.1-py3-none-any.whl", hash = "sha256:7e7c5f8d21d9fb60eb09337f3ee2d843054ff181f5fafbfd193beeec07aab092", size = 92710, upload-time = "2026-10-13T17:23:10.453Z" },
 ]
 
 [[package]]

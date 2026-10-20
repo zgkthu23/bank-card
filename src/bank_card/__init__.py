@@ -147,6 +147,29 @@ def main() -> None:
     openai.checkout(roogoo_card.card_number, roogoo_card.cvv, roogoo_card.expiry, amount=1.0, tx_minute=125)
     moscow_gift.checkout(roogoo_card.card_number, roogoo_card.cvv, roogoo_card.expiry, amount=300.0, tx_minute=128)
 
+    print("\n================================================================================")
+    print("  阶段 6：T+1 日终 BASE II 批量清分、全球多边轧差、VSS-110 报表与纽约 Fedwire 头寸调拨")
+    print("================================================================================")
+    # 模拟双向跨境交易：一位美国游客持摩根大通 Visa 卡来中国上海旅游，刷了招商银行境内 POS 机 $10.00 USD
+    cmb_cn_bank.record_inbound_foreign_card_acquiring(
+        foreign_tourist="Bob (美国游客)",
+        foreign_bank="JPMorgan Chase US",
+        domestic_merchant="上海外滩华尔道夫酒店 (招行境内收单 POS)",
+        amount_usd=10.0,
+    )
+
+    # 第 1 步：Stripe 日终打包上传 BASE II (TC05) 批量请款清分文件（自动剔除黑客那笔未请款的 $1.00 探卡预授权！）
+    stripe.submit_base_ii_clearing_batch()
+
+    # 第 2~4 步：VisaNet 执行全球多边轧差 (Multilateral Netting) -> 下发《VSS-110 清算报表》
+    #            -> 发卡行本地流水逐笔对账 (解冻未请款 $1) -> 调动纽约代理行 (Nostro) 美元头寸通过 Fedwire 划给 Visa 中央专户
+    #            -> Visa 向 Stripe 拨付收单净额
+    visa_net.run_base_ii_multilateral_netting_and_settle(acquirer=stripe)
+
+    # 第 5 步：国内持卡人账单日“人民币自动购汇还款”闭环（解答为什么刷招行/中行信用卡不需要提前存美元）
+    cmb_cn_bank.auto_repay_credit_bill_in_cny(cmb_visa, spot_fx_rate=7.2500)
+
 
 if __name__ == "__main__":
     main()
+

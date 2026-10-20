@@ -4,6 +4,7 @@ from bank_card.models import (
     AppleGiftCard,
     AuthRequest,
     AuthResponse,
+    BaseIIClearingRecord,
     CardBehavioralProfile,
     CardTierConfig,
     InCommPOSARequest,
@@ -11,6 +12,7 @@ from bank_card.models import (
     SAFEDeclaration,
     SwiftMT103Message,
     Transaction,
+    VSSSettlementReport,
     VirtualCard,
 )
 
@@ -42,14 +44,17 @@ def verify_luhn(card_number: str) -> bool:
 
 
 class CardNetwork:
-    """全球支付网络 / 卡组织（如 VisaNet）"""
+    """全球支付网络 / 卡组织（如 VisaNet：含 BASE I 实时授权路由与 BASE II 批量多边轧差清算引擎）"""
 
-    SCHEME_FEE_RATE = 0.0015
+    SCHEME_FEE_RATE = 0.0015       # Visa 卡组织网络清算服务费率 (0.15%)
+    INTERCHANGE_FEE_RATE = 0.0175  # 跨行交换费率 (1.75%，由收单行让渡给发卡行)
 
     def __init__(self, name: str = "VisaNet"):
         self.name = name
         self.bin_table: dict[str, "IssuerBank"] = {}
         self.behavioral_profiles: dict[str, CardBehavioralProfile] = {}
+        self.base_ii_clearing_batch: list[BaseIIClearingRecord] = []
+        self.visa_fedwire_settlement_pool_usd: float = 0.0  # Visa 在纽约美联储设立的中央对手方结算专户
         self.revenue: float = 0.0
 
     def register_issuer(self, bin_prefix: str, issuer: "IssuerBank") -> None:
@@ -166,25 +171,146 @@ class CardNetwork:
         self._update_profile_after_tx(profile, req, resp.approved)
         return resp
 
+    def receive_base_ii_batch(self, records: list[BaseIIClearingRecord]) -> None:
+        """接收收单行在日终上传的 BASE II (TC05) 批量请款清分文件"""
+        self.base_ii_clearing_batch.extend(records)
+
+    def run_base_ii_multilateral_netting_and_settle(self, acquirer: "Acquirer") -> dict[str, VSSSettlementReport]:
+        """
+        【VisaNet BASE II 核心跑批系统：全球多边轧差 (Multilateral Netting) + VSS-110 报表下发 + 纽约 Fedwire 净头寸清算】
+        核心铁律：
+        1. 实时授权流水 (BASE I) != 最终清算账单 (BASE II)，未请款的 $1 探卡预授权绝不计入应付账款；
+        2. 全球银行不需要两两互相打钱，Visa 作为【中央对手方 (Central Counterparty)】，将同一家银行的
+           “发卡应付”、“收单应收”、“交换费分润 (+1.75%)”、“卡组织网络费 (-0.15%)”全部对冲轧差，
+           在《VSS-110 报表》里给出一个唯一的【美元净头寸 (Net Settlement Position)】；
+        3. 各家银行核对本地流水无误后，指令其存放在【美国纽约代理行 (Nostro Account)】里的真实美元，
+           通过美国本土【Fedwire (美联储大额支付系统)】划入 Visa 纽约中央结算专户，再由 Visa 统一分发给收单行。
+        """
+        print(f"\n[清算第 2 步：{self.name} BASE II 超级计算机跑批 —— 全球多边轧差与下发《VSS-110 清算报表》]")
+        reports: dict[str, VSSSettlementReport] = {}
+
+        for bin_prefix, issuer in self.bin_table.items():
+            # 统计该银行本地 EA Server 记录的 T+0 授权总额
+            local_auth_total = round(sum(tx.amount for tx in issuer.local_auth_journal.values()), 2)
+
+            # 筛选 BASE II 中属于该发卡行且商户已实际请款 (Captured) 的记录
+            issuer_captured_records = [r for r in self.base_ii_clearing_batch if r.issuer_bin == bin_prefix]
+            captured_auth_ids = {r.auth_id for r in issuer_captured_records}
+            unmatched_auth_ids = [
+                auth_id for auth_id in issuer.local_auth_journal if auth_id not in captured_auth_ids
+            ]
+
+            issuer_payable = round(sum(r.captured_usd for r in issuer_captured_records), 2)
+            acquirer_receivable = round(issuer.inbound_acquiring_receivable_usd, 2)
+
+            if local_auth_total == 0 and issuer_payable == 0 and acquirer_receivable == 0:
+                continue
+
+            # 计算交换费净收支：发卡行赚取 +1.75%，收单侧付出 -1.75%
+            irf_earned = round(sum(r.interchange_fee_usd for r in issuer_captured_records), 2)
+            irf_paid_on_acquiring = round(acquirer_receivable * self.INTERCHANGE_FEE_RATE, 2)
+            interchange_net = round(irf_earned - irf_paid_on_acquiring, 2)
+
+            # 计算应付 Visa 卡组织网络清算费 (0.15% * 双边清算总额)
+            scheme_fee_issuer = round(sum(r.visa_scheme_fee_usd for r in issuer_captured_records), 2)
+            scheme_fee_acquirer = round(acquirer_receivable * self.SCHEME_FEE_RATE, 2)
+            total_scheme_fee = round(scheme_fee_issuer + scheme_fee_acquirer, 2)
+
+            # 最终多边轧差净头寸：-发卡应付 + 收单应收 + 交换费净额 - Visa网络费
+            net_position = round(-issuer_payable + acquirer_receivable + interchange_net - total_scheme_fee, 2)
+
+            report = VSSSettlementReport(
+                report_id=f"VSS-110-{bin_prefix}",
+                member_bank_name=issuer.name,
+                nostro_account_bic=issuer.nostro_bic,
+                local_auth_total_usd=local_auth_total,
+                base_ii_issuer_payable_usd=issuer_payable,
+                base_ii_acquirer_receivable_usd=acquirer_receivable,
+                interchange_fee_net_usd=interchange_net,
+                visa_scheme_fee_usd=total_scheme_fee,
+                net_settlement_position_usd=net_position,
+                unmatched_auth_ids=unmatched_auth_ids,
+            )
+            reports[bin_prefix] = report
+
+            direction = "应付 Visa 中央专户" if net_position < 0 else "应收 Visa 中央专户"
+            print(
+                f"  📄 [{self.name} 下发报表 {report.report_id}] 接收机构: 【{issuer.name}】\n"
+                f"     ├─ 对比本地实时授权流水总额: ${local_auth_total:.2f} USD vs BASE II 实际请款总额: ${issuer_payable:.2f} USD\n"
+                f"     ├─ 多边轧差明细: 发卡应付(-${issuer_payable:.2f}) + 境内收单冲抵(+${acquirer_receivable:.2f}) "
+                f"+ 交换费净收支({interchange_net:+.2f}) - Visa网络费(-${total_scheme_fee:.2f})\n"
+                f"     └─ 🎯 【VSS-110 核定最终美元净头寸】: {direction} ${abs(net_position):.2f} USD "
+                f"(结算账户: {issuer.nostro_bic})"
+            )
+
+        # 第 3 步：各发卡行执行本地流水对账 (Reconciliation)、释放未请款预授权，并通过纽约 Fedwire 划拨净头寸
+        print(f"\n[清算第 3 步：各发卡行本地 EA 流水自动对账 + 纽约代理行 (Nostro Account) Fedwire 头寸划拨]")
+        for bin_prefix, report in reports.items():
+            issuer = self.bin_table[bin_prefix]
+            issuer_records = [r for r in self.base_ii_clearing_batch if r.issuer_bin == bin_prefix]
+            issuer.reconcile_vss_and_wire_fedwire(report, issuer_records, self)
+
+        # 同时如果存在境外银行（如美国 Chase）持卡人在招行境内 POS 刷卡的应收款，由境外发卡行划入 Visa 中央池
+        for issuer in self.bin_table.values():
+            if issuer.inbound_acquiring_receivable_usd > 0:
+                gross_in = issuer.inbound_acquiring_receivable_usd
+                chase_irf = round(gross_in * self.INTERCHANGE_FEE_RATE, 2)
+                chase_scheme = round(gross_in * self.SCHEME_FEE_RATE, 2)
+                chase_wire = round(gross_in - chase_irf + chase_scheme, 2)
+                self.visa_fedwire_settlement_pool_usd = round(
+                    self.visa_fedwire_settlement_pool_usd + chase_wire, 2
+                )
+                self.revenue = round(self.revenue + chase_scheme, 2)
+                print(
+                    f"  🏛️ [境外发卡行 JPMorgan Chase US · Fedwire 划入] 为来华游客在中国商户消费的 ${gross_in:.2f} USD "
+                    f"向 Visa 纽约中央结算池划入净头寸 +${chase_wire:.2f} USD"
+                )
+
+        # 第 4 步：Visa 纽约中央专户扣除自身网络费后，通过 Fedwire 将收单净额划拨给 Stripe 收单行
+        acquirer.receive_visa_fedwire_settlement(self.base_ii_clearing_batch, self)
+        return reports
+
 
 class IssuerBank:
-    """持牌发卡银行"""
+    """持牌发卡银行（含境内/离岸核心账本 + 驻美国纽约代理行美元往来头寸池 Nostro Account）"""
 
     INTERCHANGE_FEE_RATE = 0.0175
     BIN_SUSPEND_THRESHOLD = 3
     VAA_BLOCK_THRESHOLD = 80
 
-    def __init__(self, name: str, region: str, scheme: str = "Visa", default_funding: str = "credit"):
+    def __init__(
+        self,
+        name: str,
+        region: str,
+        scheme: str = "Visa",
+        default_funding: str = "credit",
+        nostro_bic: str = "",
+    ):
         self.name = name
         self.region = region
         self.scheme = scheme
         self.default_funding = default_funding
+        self.nostro_bic = nostro_bic or (
+            "CHASUS33 (驻纽约摩根大通美元往来账户 Nostro)"
+            if region != "PR"
+            else "FRNYUS33 (驻纽约联储准备金账户 Fed Account)"
+        )
         self.bin_prefix: str = ""
         self.cards: dict[str, VirtualCard] = {}
         self.baas_platform = None
         self.revenue: float = 0.0
         self.bin_decline_count: int = 0
         self.bin_suspended: bool = False
+        # 银行存放在美国本土银行体系内的真实美元头寸储备 (真美元永远留在美国银行体系内！)
+        self.usd_nostro_balance: float = 500_000.0
+        # 银行在境内的人民币资金池（用于接收国内信用卡持卡人的人民币自动购汇还款）
+        self.cny_domestic_pool: float = 0.0
+        # 发卡行自己机房 EA Server 记录的 T+0 本地授权流水日志 (auth_id -> Transaction)
+        self.local_auth_journal: dict[str, Transaction] = {}
+        # 该银行作为境内收单行（如外国游客在中国刷招行 POS 机）产生的应收美元，用于演示多边轧差
+        self.inbound_acquiring_receivable_usd: float = 0.0
+        # 信用卡已入账待还款的外币账单 (card_number -> billed_usd)
+        self.posted_credit_bills_usd: dict[str, float] = {}
 
     def issue_direct_card(self, owner: str, initial_balance: float, card_name: str = "") -> VirtualCard:
         region_cn = REGION_NAMES.get(self.region, self.region)
@@ -268,7 +394,16 @@ class IssuerBank:
             print(f"  -> [{self.name} 3DS 验证通过] 持卡人 [{card.user_label}] 已完成 3DS 动态码验证")
 
         if self.baas_platform:
-            return self.baas_platform.handle_auth_webhook(card, req)
+            resp = self.baas_platform.handle_auth_webhook(card, req)
+            if resp.approved:
+                self.local_auth_journal[resp.auth_id] = Transaction(
+                    auth_id=resp.auth_id,
+                    card_number=req.card_number,
+                    merchant_name=req.merchant_name,
+                    amount=req.amount,
+                    is_auth_only_probe=(req.amount <= 1.0),
+                )
+            return resp
 
         if card.available_balance < req.amount:
             return AuthResponse(approved=False, code="51", message="银行卡可用额度不足")
@@ -276,11 +411,107 @@ class IssuerBank:
         card.available_balance = round(card.available_balance - req.amount, 2)
         card.frozen_balance = round(card.frozen_balance + req.amount, 2)
         auth_id = f"AUTH-{random.randint(1000, 9999)}"
+        self.local_auth_journal[auth_id] = Transaction(
+            auth_id=auth_id,
+            card_number=req.card_number,
+            merchant_name=req.merchant_name,
+            amount=req.amount,
+            is_auth_only_probe=(req.amount <= 1.0),
+        )
         print(
             f"  <- [{self.name} 授权通过({auth_id})] 传统银行直联扣款冻结 ${req.amount:.2f} "
             f"(0附加手续费 | 剩余额度: ${card.available_balance:.2f})"
         )
         return AuthResponse(approved=True, code="00", message="Approved", auth_id=auth_id)
+
+    def record_inbound_foreign_card_acquiring(
+        self, foreign_tourist: str, foreign_bank: str, domestic_merchant: str, amount_usd: float
+    ) -> None:
+        """模拟外国游客持境外 Visa 卡在中国境内刷本行 POS 机，形成本行对 VisaNet 的【应收美元头寸】"""
+        self.inbound_acquiring_receivable_usd = round(self.inbound_acquiring_receivable_usd + amount_usd, 2)
+        print(
+            f"  🌐 [{self.name} · 境内 POS 外卡收单] 外国游客 [{foreign_tourist}] 持 [{foreign_bank}] Visa 卡\n"
+            f"     在境内商户【{domestic_merchant}】刷卡消费折合 ${amount_usd:.2f} USD ➔ 记入本行应收 Visa 清算款 +${amount_usd:.2f} USD"
+        )
+
+    def reconcile_vss_and_wire_fedwire(
+        self,
+        report: VSSSettlementReport,
+        captured_records: list[BaseIIClearingRecord],
+        visa_net: CardNetwork,
+    ) -> None:
+        """
+        发卡行收到 Visa VSS-110 报表后的自动化处理：
+        1. 将本地 EA Server 授权流水日志与 BASE II 实际请款记录逐笔勾兑 (Reconciliation)；
+        2. 对已请款交易：将冻结额度转为正式入账账单；对商户未请款的 $1 探卡预授权：自动解冻释放回可用余额；
+        3. 指令本行设在美国纽约的代理行账户 (Nostro Account)，通过 Fedwire 向 Visa 纽约中央结算账户划拨美元净头寸。
+        """
+        print(f"  🔍 [{self.name} · 本地对账系统] 正在将本地 EA 授权流水与 [{report.report_id}] 逐笔勾兑...")
+        for rec in captured_records:
+            local_tx = self.local_auth_journal.get(rec.auth_id)
+            card = self.cards[rec.card_number]
+            card.frozen_balance = round(card.frozen_balance - rec.captured_usd, 2)
+            if local_tx:
+                local_tx.settled = True
+            if card.tier.funding_type == "credit":
+                self.posted_credit_bills_usd[card.card_number] = round(
+                    self.posted_credit_bills_usd.get(card.card_number, 0.0) + rec.captured_usd, 2
+                )
+            print(
+                f"     ├─ ✅ 勾兑成功 [{rec.auth_id} <-> {rec.clearing_id}]: 商户 [{rec.merchant_name}] "
+                f"请款 ${rec.captured_usd:.2f} USD (本行赚取交换费 +${rec.interchange_fee_usd:.2f} USD)"
+            )
+
+        # 处理本地已授权冻结、但商户在 BASE II 中未实际请款的交易（如黑客 $1 小额探卡）
+        for unmatched_id in report.unmatched_auth_ids:
+            unmatched_tx = self.local_auth_journal[unmatched_id]
+            card = self.cards[unmatched_tx.card_number]
+            card.frozen_balance = round(card.frozen_balance - unmatched_tx.amount, 2)
+            card.available_balance = round(card.available_balance + unmatched_tx.amount, 2)
+            print(
+                f"     ├─ 🔓 识别出未请款预授权 [{unmatched_id}]: 商户 [{unmatched_tx.merchant_name}] 未对 ${unmatched_tx.amount:.2f} 发起 BASE II 请款！"
+                f"已自动解冻并退回持卡人可用余额 (当前可用: ${card.available_balance:.2f})"
+            )
+
+        self.revenue = round(self.revenue + report.interchange_fee_net_usd - report.visa_scheme_fee_usd, 2)
+
+        # 通过美国纽约代理行 (Nostro Account) & Fedwire 划拨轧差后的净美元头寸
+        if report.net_settlement_position_usd < 0:
+            wire_usd = abs(report.net_settlement_position_usd)
+            self.usd_nostro_balance = round(self.usd_nostro_balance - wire_usd, 2)
+            visa_net.visa_fedwire_settlement_pool_usd = round(
+                visa_net.visa_fedwire_settlement_pool_usd + wire_usd, 2
+            )
+            visa_net.revenue = round(visa_net.revenue + report.visa_scheme_fee_usd, 2)
+            print(
+                f"     └─ 💸 [纽约 Fedwire 头寸调拨] [{self.name}] 指令【{self.nostro_bic}】\n"
+                f"        划出轧差净头寸 -${wire_usd:.2f} USD ➔ 【Visa 纽约中央结算专户】 "
+                f"(本行纽约 Nostro 剩余美元头寸: ${self.usd_nostro_balance:,.2f} USD)"
+            )
+
+    def auto_repay_credit_bill_in_cny(self, card: VirtualCard, spot_fx_rate: float = 7.2500) -> None:
+        """
+        【解答：为什么刷国内银行 Visa 信用卡不需要提前存美金？】
+        1. 刷卡次日 (T+1)，银行已经动用其存放在【美国纽约代理行 (Nostro Account)】的真美元替你和 Visa 结清了账单；
+        2. 到了国内账单还款日，你只需直接还人民币！银行开启【人民币自动购汇还款】，按当日牌价扣取你的人民币，
+           收进银行境内人民币资金池，冲平你的美元信用卡欠款。
+        """
+        billed_usd = self.posted_credit_bills_usd.get(card.card_number, 0.0)
+        if billed_usd <= 0:
+            return
+
+        cny_needed = round(billed_usd * spot_fx_rate, 2)
+        self.cny_domestic_pool = round(self.cny_domestic_pool + cny_needed, 2)
+        self.posted_credit_bills_usd[card.card_number] = 0.0
+        card.available_balance = round(card.available_balance + billed_usd, 2)
+
+        print(
+            f"\n[清算第 5 步：国内持卡人账单日“人民币自动购汇还款”闭环 (不占个人 5 万美元购汇额度)]\n"
+            f"  💳 [{self.name} · 自动购汇还款] 持卡人 [{card.owner}] 信用卡外币已入账账单: ${billed_usd:.2f} USD\n"
+            f"     ├─ 持卡人操作: 无需提前存美金！直接从 [{card.owner}] 境内人民币储蓄卡扣取 ¥{cny_needed:.2f} CNY (@牌价 {spot_fx_rate:.4f})\n"
+            f"     ├─ 银行内部平盘: [{self.name}] 境内人民币资金池 +¥{cny_needed:.2f} CNY (补偿此前纽约 Nostro 账户垫付的美元头寸)\n"
+            f"     └─ ✅ 账单结清！卡片信用额度已恢复至: ${card.available_balance:.2f} USD"
+        )
 
 
 class RoogooPlatform:
@@ -527,12 +758,96 @@ class Acquirer:
                     card_number=card_number,
                     merchant_name=merchant.name,
                     amount=amount,
+                    is_auth_only_probe=(amount <= 1.0),
                 )
             )
         else:
             print(f"  <- [{self.name}] 收到发卡行拒绝回执：[{resp.code}] {resp.message}")
 
         return resp
+
+    def submit_base_ii_clearing_batch(self) -> list[BaseIIClearingRecord]:
+        """
+        【日终 T+1 第一步：收单行向 VisaNet BASE II 系统上传《TC05 批量请款清分文件》】
+        为什么不能直接按 T+0 授权流水结账？
+        因为：
+        1. 酒店押金、租车预授权、或者 $1.00 绑卡/黑客探卡测试 (Auth-Only)，商户最终不会发货也不会请款 (Not Captured)；
+        2. 只有商户确认交货并调用 Capture 接口的交易，收单行才会打包进 BASE II (TC05) 清分批次文件送交 VisaNet。
+        """
+        print(f"\n[清算第 1 步：{self.name} 日终打包上传《BASE II (TC05) 批量请款清分文件》]")
+        batch: list[BaseIIClearingRecord] = []
+
+        for tx in self.pending_transactions:
+            if tx.settled:
+                continue
+
+            if tx.is_auth_only_probe:
+                # $1.00 探卡/预授权验证：商户不请款，从收单行待结算池剔除
+                acct = self.merchant_accounts[tx.merchant_name]
+                acct.pending_balance = round(acct.pending_balance - tx.amount, 2)
+                tx.settled = True
+                print(
+                    f"  ⏭️ [{self.name} · 剔除未请款预授权] 授权单 [{tx.auth_id}] ({tx.merchant_name} ${tx.amount:.2f}) "
+                    f"属于 $1 小额探卡/预授权 (Auth-Only)，商户未发起 Capture 请款，不纳入 BASE II 清算！"
+                )
+                continue
+
+            irf_usd = round(tx.amount * self.network.INTERCHANGE_FEE_RATE, 2)
+            scheme_usd = round(tx.amount * self.network.SCHEME_FEE_RATE, 2)
+            rec = BaseIIClearingRecord(
+                clearing_id=f"TC05-{random.randint(10000, 99999)}",
+                auth_id=tx.auth_id,
+                card_number=tx.card_number,
+                issuer_bin=tx.card_number[:6],
+                merchant_name=tx.merchant_name,
+                acquirer_name=self.name,
+                authorized_usd=tx.amount,
+                captured_usd=tx.amount,
+                interchange_fee_usd=irf_usd,
+                visa_scheme_fee_usd=scheme_usd,
+            )
+            tx.settled = True
+            batch.append(rec)
+            print(
+                f"  📦 [{self.name} 打包 TC05 清分单 {rec.clearing_id}] 关联授权:{rec.auth_id} | "
+                f"发卡BIN:{rec.issuer_bin} | 商户:{rec.merchant_name} | 实际请款: ${rec.captured_usd:.2f} USD"
+            )
+
+        self.network.receive_base_ii_batch(batch)
+        return batch
+
+    def receive_visa_fedwire_settlement(
+        self, records: list[BaseIIClearingRecord], visa_net: CardNetwork
+    ) -> None:
+        """收到 Visa 纽约中央结算专户通过 Fedwire 划来的收单结算净额，并分账至各商户可用余额"""
+        gross_sales = round(sum(r.captured_usd for r in records), 2)
+        total_irf_deducted = round(sum(r.interchange_fee_usd for r in records), 2)
+        acquirer_scheme_fee = round(sum(r.visa_scheme_fee_usd for r in records), 2)
+        net_from_visa = round(gross_sales - total_irf_deducted - acquirer_scheme_fee, 2)
+
+        visa_net.visa_fedwire_settlement_pool_usd = round(
+            visa_net.visa_fedwire_settlement_pool_usd - net_from_visa, 2
+        )
+        visa_net.revenue = round(visa_net.revenue + acquirer_scheme_fee, 2)
+
+        print(
+            f"\n[清算第 4 步：Visa 纽约中央专户 ➔ {self.name} Fedwire 入账与商户分账]\n"
+            f"  🏦 [{self.name}] 收到【Visa 纽约中央结算专户】Fedwire 划入净结算款: +${net_from_visa:.2f} USD\n"
+            f"     (计算公式: 商户请款总额 ${gross_sales:.2f} - 让渡给发卡行的交换费 ${total_irf_deducted:.2f} "
+            f"- 支付 Visa 网络费 ${acquirer_scheme_fee:.2f})"
+        )
+
+        for r in records:
+            acct = self.merchant_accounts[r.merchant_name]
+            stripe_fee = round(r.captured_usd * 0.029 + 0.30, 2)
+            merchant_net = round(r.captured_usd - stripe_fee, 2)
+            acct.pending_balance = round(acct.pending_balance - r.captured_usd, 2)
+            acct.available_balance = round(acct.available_balance + merchant_net, 2)
+            print(
+                f"     ├─ 商户 [{r.merchant_name}] 结算入账: 原始订单 ${r.captured_usd:.2f} "
+                f"- Stripe 收单费(2.9%+$0.30) ${stripe_fee:.2f} ➔ 可提现余额 +${merchant_net:.2f} USD"
+            )
+
 
 
 class SAFEForeignExchangeBureau:

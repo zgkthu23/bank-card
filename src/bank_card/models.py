@@ -134,13 +134,46 @@ class AuthResponse:
 
 @dataclass
 class Transaction:
-    """待清算的已授权交易流水"""
+    """T+0 待清算的已授权交易流水（BASE I 实时授权层记录）"""
 
     auth_id: str
     card_number: str
     merchant_name: str
     amount: float
+    is_auth_only_probe: bool = False  # 是否仅为 $1 小额探卡/预授权（商户最终不会发起 BASE II 实际请款）
     settled: bool = False
+
+
+@dataclass
+class BaseIIClearingRecord:
+    """【VisaNet BASE II 系统 · TC05 批量请款清分记录 (Clearing Presentment Record)】"""
+
+    clearing_id: str          # BASE II 清分流水号 ("TC05-...")
+    auth_id: str              # 关联的 T+0 授权号 ("AUTH-...")
+    card_number: str          # 16位卡号 (PAN)
+    issuer_bin: str           # 发卡行 6位 BIN
+    merchant_name: str        # 请款商户名称
+    acquirer_name: str        # 送呈收单行名称
+    authorized_usd: float     # T+0 原始授权冻结金额
+    captured_usd: float       # T+1 商户实际提交请款金额 (Capture Amount)
+    interchange_fee_usd: float  # 发卡行交换费分润 (1.75%，由收单行让渡给发卡行)
+    visa_scheme_fee_usd: float  # Visa 卡组织网络清算费 (0.15%)
+
+
+@dataclass
+class VSSSettlementReport:
+    """【Visa Settlement Service (VSS-110) 每日机构净头寸清算报表】"""
+
+    report_id: str                      # 报表编号 ("VSS-110-...")
+    member_bank_name: str               # 成员银行名称
+    nostro_account_bic: str             # 该银行在美国纽约的美元往来账户 (Nostro Account)
+    local_auth_total_usd: float         # 银行本地 T+0 实时授权流水总额 (仅供参考，不作为打款依据)
+    base_ii_issuer_payable_usd: float   # BASE II 实际请款应付本金 (发卡侧支出)
+    base_ii_acquirer_receivable_usd: float  # BASE II 实际收单应收本金 (收单侧收入，用于多边轧差抵消)
+    interchange_fee_net_usd: float      # 交换费净收支 (+为发卡收入，-为收单支出)
+    visa_scheme_fee_usd: float          # 应付 Visa 网络清算服务费
+    net_settlement_position_usd: float  # 最终轧差净头寸 (负数代表银行需通过 Fedwire 向 Visa 付款，正数代表收款)
+    unmatched_auth_ids: list[str] = field(default_factory=list)  # T+0 已授权但商户未请款的预授权单号
 
 
 @dataclass
@@ -150,3 +183,4 @@ class MerchantStripeAccount:
     merchant_name: str
     pending_balance: float = 0.0
     available_balance: float = 0.0
+

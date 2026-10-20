@@ -19,6 +19,9 @@ build-backend = "uv_build"
 [tool.uv]
 python-preference = "only-system"
 
+[tool.uv.sources]
+pudb = { git = "https://github.com/zgkthu23/pudb", branch = "zgk-maintenance" }
+
 [dependency-groups]
 dev = [
     "pudb>=2026.1",
